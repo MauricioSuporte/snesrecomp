@@ -1245,6 +1245,77 @@ static void bat_write_set(FILE* f, const char* name, const char* value) {
     fprintf(f, "\"\r\n");
 }
 
+static int bat_is_ascii(const char* s) {
+    for (; *s; ++s)
+        if ((unsigned char)*s >= 0x80)
+            return 0;
+    return 1;
+}
+
+/* Rebases `path` from `root` onto `alias` when it lives under root. */
+static int bat_rebase(char* out, size_t cap, const char* path,
+                      const char* root, const char* alias) {
+    size_t n = strlen(root);
+    if (_strnicmp(path, root, n) != 0 ||
+        (path[n] && path[n] != '/' && path[n] != '\\'))
+        return 0;
+    return snprintf(out, cap, "%s%s", alias, path + n) < (int)cap;
+}
+
+/* CMake writes its own post-build scripts (mod catalog, launcher assets) in
+ * UTF-8, which cmd.exe misreads, and it expands 8.3 short names back to the
+ * long path. A project under a non-ASCII folder ("Área de Trabalho") is
+ * therefore built through an ASCII directory junction in the public profile;
+ * junctions need no administrator rights and CMake keeps the alias path. */
+static void bat_write_ascii_alias(FILE* f) {
+    const char* pub = getenv("PUBLIC");
+    char base[600], alias[700], fwd[700], build[1200], exe[1200];
+    unsigned h = 2166136261u;
+    if (bat_is_ascii(g_project_root))
+        return;
+    if (pub && pub[0] && bat_is_ascii(pub))
+        snprintf(base, sizeof(base), "%s\\retcomm-builds", pub);
+    else
+        snprintf(base, sizeof(base), "C:\\retcomm-builds");
+    for (const char* p = g_project_root; *p; ++p)
+        h = (h ^ (unsigned char)tolower((unsigned char)*p)) * 16777619u;
+    snprintf(alias, sizeof(alias), "%s\\%s-%08x", base, g_cmake_target, h);
+    if (!bat_is_ascii(alias))
+        return;
+    snprintf(fwd, sizeof(fwd), "%s", alias);
+    for (char* p = fwd; *p; ++p)
+        if (*p == '\\')
+            *p = '/';
+    bat_write_set(f, "ALIAS", alias);
+    bat_write_set(f, "ALIAS_FWD", fwd);
+    fprintf(f, "if not exist \"%%ALIAS%%\\\" (\r\n"
+               "  rmdir \"%%ALIAS%%\" 2>NUL\r\n"
+               "  mkdir \"");
+    {
+        char text[700];
+        fputs(bat_text(base, text, sizeof(text)), f);
+    }
+    fprintf(f, "\" 2>NUL\r\n"
+               "  mklink /J \"%%ALIAS%%\" \"%%ROOT%%\" >NUL\r\n"
+               ")\r\n"
+               "if exist \"%%ALIAS%%\\\" (\r\n"
+               "  set \"ROOT=%%ALIAS%%\"\r\n");
+    if (bat_rebase(build, sizeof(build), g_build_dir, g_project_root, alias))
+        fprintf(f, "  set \"BUILD_DIR=%s\"\r\n", build);
+    if (bat_rebase(exe, sizeof(exe), g_exe_path, g_project_root, alias))
+        fprintf(f, "  set \"EXE=%s\"\r\n", exe);
+    fprintf(f, ")\r\n"
+               /* A tree configured through the long path keeps writing the
+                * broken scripts: configure again through the alias. */
+               "if exist \"%%ALIAS%%\\\" if exist \"%%BUILD_DIR%%\\CMakeCache.txt\" (\r\n"
+               "  findstr /I /L /C:\"CMAKE_HOME_DIRECTORY:INTERNAL=%%ALIAS_FWD%%\" "
+               "\"%%BUILD_DIR%%\\CMakeCache.txt\" >NUL || (\r\n"
+               "    del /q \"%%BUILD_DIR%%\\CMakeCache.txt\"\r\n"
+               "    rmdir /s /q \"%%BUILD_DIR%%\\CMakeFiles\" 2>NUL\r\n"
+               "  )\r\n"
+               ")\r\n");
+}
+
 static int write_windows_deferred_rebuild_helper(char* err_msg, size_t err_cap) {
     if (!join_path(g_helper_path, sizeof(g_helper_path), g_build_dir,
                    "recomp_deferred_rebuild.cmd")) {
@@ -1275,6 +1346,7 @@ static int write_windows_deferred_rebuild_helper(char* err_msg, size_t err_cap) 
     bat_write_set(f, "TARGET", g_cmake_target);
     bat_write_set(f, "DISPLAY", g_display);
     bat_write_set(f, "PACK", g_toolchain_root);
+    bat_write_ascii_alias(f);
     fprintf(f,
             "echo Waiting for %%DISPLAY%% to exit...\r\n"
             ":waitloop\r\n"
