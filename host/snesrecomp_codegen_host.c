@@ -1606,17 +1606,11 @@ static void handoff_to_rebuilt_or_return(void) {
         return;
     if (!g_exe_path[0] || !path_is_file(g_exe_path))
         return;
-    if (g_exe_dir[0]) {
-        char exe_name[300];
-#if defined(_WIN32)
-        snprintf(exe_name, sizeof(exe_name), "%s.exe", g_cfg->exe_basename);
-#else
-        snprintf(exe_name, sizeof(exe_name), "%s", g_cfg->exe_basename);
-#endif
-        have_self = join_path(self, sizeof(self), g_exe_dir, exe_name);
-        if (have_self && same_file_path(self, g_exe_path))
-            return;   /* build/ IS where we are running from */
-    }
+    /* The running file itself, whatever it is named: a setup host shipped
+     * under another name must still compare against the rebuilt game. */
+    have_self = snesrecomp_exe_path(self, sizeof(self));
+    if (have_self && same_file_path(self, g_exe_path))
+        return;   /* build/ IS where we are running from */
     /* An UPDATE, not a second launch: the player unpacked a newer pack over
      * the folder, so the setup binary is newer than the game the last rebuild
      * produced. Handing off there would run the old build forever and the
@@ -1736,7 +1730,13 @@ void snesrecomp_codegen_host_autowire(RecompLauncherCGameInfo* gi,
     static char exe_name[256];
 
     if (!gi) return;
+#ifdef SNESRECOMP_GAME_TARGET
+    /* A packager may ship the setup host under a friendlier file name; the
+     * CMake target and the rebuilt binary keep the target's own name. */
+    snprintf(exe_name, sizeof(exe_name), "%s", SNESRECOMP_GAME_TARGET);
+#else
     if (!snesrecomp_exe_basename(exe_name, sizeof(exe_name))) return;
+#endif
 
     memset(&cfg, 0, sizeof(cfg));
     cfg.display_name = display_name;
