@@ -1205,7 +1205,24 @@ static int host_prepare_generate(const char* source_path, char* out_path,
 }
 
 #if defined(_WIN32)
+/* The host keeps paths in the ANSI code page (the *A APIs), but cmd.exe
+ * reads a batch file in the console's OEM code page, so "Área de Trabalho"
+ * arrived as "┴rea de Trabalho" and the rebuild could not find its source.
+ * The helper switches to UTF-8 first (chcp 65001) and every path is written
+ * as UTF-8. */
+static const char* bat_utf8(const char* ansi, char* out, size_t cap) {
+    WCHAR wide[2048];
+    if (MultiByteToWideChar(CP_ACP, 0, ansi, -1, wide,
+                            (int)(sizeof(wide) / sizeof(wide[0]))) > 0 &&
+        WideCharToMultiByte(CP_UTF8, 0, wide, -1, out, (int)cap, NULL,
+                            NULL) > 0)
+        return out;
+    return ansi;
+}
+
 static void bat_write_set(FILE* f, const char* name, const char* value) {
+    char utf8[4096];
+    value = bat_utf8(value, utf8, sizeof(utf8));
     fprintf(f, "set \"%s=", name);
     for (const char* p = value; *p; ++p) {
         if (*p == '%')
@@ -1231,8 +1248,13 @@ static int write_windows_deferred_rebuild_helper(char* err_msg, size_t err_cap) 
     snprintf(pid_buf, sizeof(pid_buf), "%lu",
              (unsigned long)GetCurrentProcessId());
     fprintf(f, "@echo off\r\n");
+    fprintf(f, "chcp 65001 >NUL\r\n");
     fprintf(f, "setlocal EnableExtensions\r\n");
-    fprintf(f, "title %s - rebuilding\r\n", g_display);
+    {
+        char utf8[1024];
+        fprintf(f, "title %s - rebuilding\r\n",
+                bat_utf8(g_display, utf8, sizeof(utf8)));
+    }
     bat_write_set(f, "PARENT_PID", pid_buf);
     bat_write_set(f, "CMAKE", g_cmake);
     bat_write_set(f, "BUILD_DIR", g_build_dir);
