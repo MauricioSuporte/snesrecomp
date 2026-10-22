@@ -185,6 +185,18 @@ int  snes_netplay_remote_lead(void);
 /* Session input delay frames (default 2 when inactive). */
 int  snes_netplay_input_delay(void);
 
+/* Host-authority diagnostics and recovery (delay-sync with
+ * SNES_NET_HOST_AUTHORITY). note_frame: wall ms one admitted frame took and
+ * whether it was a catch-up frame; note_present: one presentation. Both feed
+ * the net_diag.jsonl samples (SNES_NET_DIAG=1). */
+void snes_netplay_note_frame(double frame_ms, int catchup);
+void snes_netplay_note_present(void);
+/* 1 on a seated guest of a host-authoritative delay-sync match. */
+int  snes_netplay_host_authority_guest(void);
+/* 1 once such a guest can never be fed again (the host's ring no longer holds
+ * the row it waits on); the barrier then leaves the match with a reason. */
+int  snes_netplay_auth_guest_lost(void);
+
 /* Re-apply the last slot-0 game sync bytes (normally done inside poll_admit). */
 void snes_netplay_apply_host_sync(void);
 

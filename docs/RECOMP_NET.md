@@ -188,8 +188,12 @@ start when force-TURN is on, and filters candidates to `typ relay` at runtime
 
 ### Netplay diagnostics (JSONL)
 
-Set `SNES_NET_DIAG=1` to write `saves/netplay/net_diag.jsonl`
-(rate: `SNES_NET_DIAG_HZ`, default 2; truncated each match). Line 1 is a
+Set `SNES_NET_DIAG=1` to write
+`saves/netplay/net_diag_<YYYYMMDD_HHMMSS>_<host|guest>_slot<N>.jsonl`, one file
+per match (rate: `SNES_NET_DIAG_HZ`, default 2), and to redirect stderr to
+`saves/netplay/netplay_log.txt` (appended, one `===== netplay match` header per
+match; `SNES_NET_DIAG_KEEP_STDERR=1` keeps the console). A Windows GUI build has
+no console, so without the redirect the netplay stderr lines were lost. Line 1 is a
 `type:"summary"` object with match mode (`hosted_lobby` / `direct_ip`),
 lobby server URL, lobby id, input delay, TURN configured vs nominated ICE
 NAT path (`ice_nat`: `host` / `stun` / `turn` / `lan`, from `ice_path`
@@ -200,6 +204,37 @@ NAT path (`ice_nat`: `host` / `stun` / `turn` / `lan`, from `ice_path`
 age, packet/input counters. Sampling runs inside `snes_netplay_poll_admit`
 (no game-side hook required). Sample field `turn` is 1 only when the
 nominated path is `relay` (not merely “TURN credentials configured”).
+Samples also carry `is_host`, `host_authority`, `backlog` (host authority:
+on a guest, host rows queued past its sim tick; on the host, how far the
+slowest guest's contiguous ACK trails its sim tick; -1 unknown),
+`resend_rows` / `rows_dropped` (rows resent from a peer ACK / refused by the
+live window), and per-interval frame timing from the desktop host: `frames`
+admitted, `catchup` frames run in a catch-up burst (`catchup_total` for the
+match), `presents`, `frame_ms_avg` / `frame_ms_max` (wall time of one admitted
+frame) and the pump gap/duration maxima.
+
+### Host authority: guest catch-up and recovery
+
+With `SNES_NET_HOST_AUTHORITY=1` the host never waits, so a guest that stalls
+(a lost datagram waiting for its resend, a slow frame, a window drag) falls
+behind. The desktop host now lets such a guest run up to 3 extra frames per
+wall tick while host rows are queued past the delay runway
+(`SNES_NET_CATCHUP_CAP`, default 3 for host-authority guests and still 0
+otherwise). recomp-net accepts host rows on a guest across one whole ring
+(`[sim, sim + RNET_HISTORY_LENGTH - 1]`, no overlap with played rows), the
+host resends up to `RNET_HISTORY_LENGTH - 8` rows past a guest's contiguous
+ACK, and a two-seat guest now acknowledges host rows by contiguity (a lost
+row older than the redundancy window used to be skipped by a later row's
+"highest seen" ACK and the guest froze). Before, catch-up was 0 and the
+window/resend limit 64 rows: every stall became permanent lag that only
+grew, and past 64 rows the guest froze for good (`session_host_authority_catchup_test`).
+A guest that still falls beyond the host's ring (stalled 3 s with the host
+alive and rows refused or later rows present) logs
+`host_authority guest LOST` and leaves to the room with a reason instead of
+showing a frozen frame forever. Backlogs of 16/48/96 frames are logged as
+`snes_netplay: host_authority backlog=...` (rate-limited) and their recovery.
+`RNET_TEST_INPUT_LOSS_PCT=<0..90>` drops that share of outgoing INPUT
+datagrams for loopback tests.
 
 Input bundles must cover the full delay prefix on start (`delay+1` wire
 ticks including tick 0). `RNET_MAX_BUNDLE` is 21 (max delay 20 + 1);

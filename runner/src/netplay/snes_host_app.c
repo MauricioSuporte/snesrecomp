@@ -122,6 +122,12 @@ static void barrier_soft_exit(int from_lobby, int *running, const char *origin,
  * remote_lead rebuild toward D instead of a turbo recovery burst. */
 #define SNES_STARVATION_RECOVERY_BURST_DEFAULT 0
 #define SNES_CATCHUP_CAP_DEFAULT 0
+/* Host-authority guests: up to this many extra frames per wall tick while
+ * rows are queued past the delay runway. The host never waits, so without a
+ * catch-up every guest stall (a lost datagram's resend, a slow frame, a
+ * window drag) became permanent lag that only grew, until the guest trailed
+ * the host by more than its history and froze for good. */
+#define SNES_AUTH_CATCHUP_CAP_DEFAULT 3
 
 static struct {
   int latched;
@@ -413,6 +419,17 @@ int snes_host_barrier_admit(int from_lobby, int *running,
     return admitted;
   }
 
+  if (snes_netplay_auth_guest_lost()) {
+    const char *why =
+        "Fell too far behind the host (the connection stalled for more than "
+        "about two seconds). Rejoin the room to play again.";
+    if (from_lobby)
+      snes_host_lobby_set_runtime_error(why);
+    barrier_soft_exit(from_lobby, running, "host_authority_guest_lost",
+                      &desync_logged, &wait_logged);
+    return 0;
+  }
+
   {
     uint32_t sim = snes_netplay_sim_tick();
     int enter_need = starv_env_int("SNES_NET_STARVATION_ENTER_FRAMES",
@@ -473,7 +490,10 @@ int snes_host_catchup_budget(void)
    * and a burst here would race it. */
   if (snes_netplay_rollback_active())
     return 0;
-  cap = starv_env_int("SNES_NET_CATCHUP_CAP", SNES_CATCHUP_CAP_DEFAULT);
+  cap = starv_env_int("SNES_NET_CATCHUP_CAP",
+                      snes_netplay_host_authority_guest()
+                          ? SNES_AUTH_CATCHUP_CAP_DEFAULT
+                          : SNES_CATCHUP_CAP_DEFAULT);
   if (cap <= 0 && g_starv.recovery_amount <= 0)
     return 0;
   lead = snes_netplay_remote_lead();

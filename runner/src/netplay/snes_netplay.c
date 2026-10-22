@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #ifdef _WIN32
 #include <direct.h>
 #else
@@ -149,6 +150,10 @@ int  snes_netplay_slot_count(void) { return 2; }
 int  snes_netplay_input_player(void) { return 0; }
 uint32_t snes_netplay_sim_tick(void) { return 0; }
 uint32_t snes_netplay_frames_finished(void) { return 0; }
+void snes_netplay_note_frame(double frame_ms, int catchup) { (void)frame_ms; (void)catchup; }
+void snes_netplay_note_present(void) {}
+int  snes_netplay_host_authority_guest(void) { return 0; }
+int  snes_netplay_auth_guest_lost(void) { return 0; }
 int  snes_netplay_start(const SnesNetplayConfig *cfg)
 {
     (void)cfg;
@@ -296,6 +301,19 @@ typedef struct {
     unsigned     ice_turn_port;
     int          diag_session; /* bumped each start; resets diag file */
     uint32_t     frames_finished; /* RtlRunFrame + finish_frame count */
+    int          host_authority;  /* RNetConfig.host_authority for this match */
+    /* Frame timing between two net_diag samples (snes_netplay_note_frame). */
+    uint32_t     diag_frames;
+    uint32_t     diag_catchup_frames;
+    uint32_t     diag_presents;
+    double       diag_frame_ms_sum;
+    double       diag_frame_ms_max;
+    uint32_t     catchup_frames_total;
+    /* Backlog warnings (stderr, rate-limited) and the lost-guest exit. */
+    uint64_t     backlog_warn_ms;
+    int          backlog_warn_level;
+    uint64_t     auth_lost_since_ms;
+    uint32_t     auth_lost_dropped;
     NetplayDiagnosticState timing;
     char         last_slow_operation[48];
     char         max_slow_operation[48];
@@ -483,6 +501,8 @@ static int g_diag_file_session;
 static uint32_t g_diag_last_write_ms;
 static int g_diag_mkdir_done;
 static int g_diag_summary_written;
+static int np_diag_enabled(void);
+static void np_diag_open_log(void);
 
 void snes_netplay_request_return_to_lobby(void) { g_return_to_lobby = 1; }
 int  snes_netplay_return_to_lobby_requested(void) { return g_return_to_lobby; }
@@ -1186,6 +1206,14 @@ int snes_netplay_start(const SnesNetplayConfig *cfg)
     g_np.force_input_relay = cfg->force_input_relay ? 1 : 0;
     g_np.session_id = rcfg.session_id;
     g_np.is_host = (g_np.local_slot == 0) ? 1 : 0;
+    g_np.host_authority = rcfg.host_authority ? 1 : 0;
+    g_np.diag_frames = g_np.diag_catchup_frames = g_np.diag_presents = 0;
+    g_np.diag_frame_ms_sum = g_np.diag_frame_ms_max = 0;
+    g_np.catchup_frames_total = 0;
+    g_np.backlog_warn_ms = 0;
+    g_np.backlog_warn_level = 0;
+    g_np.auth_lost_since_ms = 0;
+    g_np.auth_lost_dropped = 0;
     snprintf(g_np.bind_hostport, sizeof(g_np.bind_hostport), "%s",
              cfg->bind_hostport);
     snprintf(g_np.peer_hostport, sizeof(g_np.peer_hostport), "%s",
@@ -1238,6 +1266,8 @@ int snes_netplay_start(const SnesNetplayConfig *cfg)
     RtlNetplayAudioReset();
 
     np_rollback_try_start();
+
+    np_diag_open_log();
 
     fprintf(stderr,
             "snes_netplay: started transport=%s slot=%d input_player=%d session=%u "
@@ -2575,6 +2605,154 @@ static void np_diag_write_summary(FILE *f, const RNetSessionStats *st, uint32_t 
             ice_local_esc, ice_remote_esc);
 }
 
+static void np_diag_mkdirs(void)
+{
+    if (g_diag_mkdir_done)
+        return;
+    g_diag_mkdir_done = 1;
+#ifdef _WIN32
+    _mkdir("saves");
+    _mkdir("saves\\netplay");
+#else
+    mkdir("saves", 0755);
+    mkdir("saves/netplay", 0755);
+#endif
+}
+
+/* With SNES_NET_DIAG on, stderr goes to saves/netplay/netplay_log.txt (append,
+ * one header per match): a Windows GUI build has no console, so without this
+ * the netplay lines (stalls, starvation, slow pumps, backlog) were lost.
+ * SNES_NET_DIAG_KEEP_STDERR=1 keeps the console for developers. */
+static void np_diag_open_log(void)
+{
+    static int redirected;
+    const char *keep;
+    if (!np_diag_enabled())
+        return;
+    keep = getenv("SNES_NET_DIAG_KEEP_STDERR");
+    if (!redirected && !(keep && keep[0] && keep[0] != '0')) {
+        np_diag_mkdirs();
+        if (freopen("saves/netplay/netplay_log.txt", "a", stderr)) {
+            redirected = 1;
+            setvbuf(stderr, NULL, _IONBF, 0);
+        }
+    }
+    fprintf(stderr,
+            "\n===== netplay match: role=%s slot=%d host_authority=%d "
+            "session=%u ticks_ms=%u monotonic_ms=%llu =====\n",
+            g_np.is_host ? "host" : "guest", g_np.local_slot,
+            g_np.host_authority, (unsigned)g_np.session_id,
+            (unsigned)SDL_GetTicks(),
+            (unsigned long long)np_diagnostic_clock_ms());
+}
+
+void snes_netplay_note_frame(double frame_ms, int catchup)
+{
+    if (!snes_netplay_active())
+        return;
+    g_np.diag_frames++;
+    g_np.diag_frame_ms_sum += frame_ms;
+    if (frame_ms > g_np.diag_frame_ms_max)
+        g_np.diag_frame_ms_max = frame_ms;
+    if (catchup) {
+        g_np.diag_catchup_frames++;
+        g_np.catchup_frames_total++;
+    }
+}
+
+void snes_netplay_note_present(void)
+{
+    if (snes_netplay_active())
+        g_np.diag_presents++;
+}
+
+int snes_netplay_host_authority_guest(void)
+{
+    return snes_netplay_active() && g_np.host_authority && !g_np.is_host &&
+           g_np.local_slot != 0 && !g_np_rollback;
+}
+
+/* Host-authority backlog watch, every 30 played frames: how far this guest
+ * trails the host (guest) or the slowest guest trails us (host). Logged when
+ * it crosses 16/48/96 frames, then at most every 5 s while it stays up. */
+static void np_auth_watch(void)
+{
+    RNetSessionStats st;
+    uint64_t now;
+    int level;
+    if (!g_np.host_authority || g_np_rollback || (g_np.frames_finished % 30u))
+        return;
+    memset(&st, 0, sizeof(st));
+    rnet_session_get_stats(g_np.session, &st);
+    level = st.auth_backlog >= 96 ? 3 : st.auth_backlog >= 48 ? 2
+          : st.auth_backlog >= 16 ? 1 : 0;
+    now = np_diagnostic_clock_ms();
+    if (level > g_np.backlog_warn_level ||
+        (level > 0 && now - g_np.backlog_warn_ms >= 5000u)) {
+        fprintf(stderr,
+                "snes_netplay: host_authority backlog=%d frames role=%s sim=%u "
+                "remote_lead=%d resend_rows=%u rows_dropped=%u catchup_total=%u "
+                "monotonic_ms=%llu\n",
+                st.auth_backlog, g_np.is_host ? "host(slowest guest)" : "guest",
+                (unsigned)st.sim_tick, st.remote_lead,
+                (unsigned)st.auth_resend_rows, (unsigned)st.auth_rows_dropped,
+                (unsigned)g_np.catchup_frames_total,
+                (unsigned long long)now);
+        g_np.backlog_warn_ms = now;
+    } else if (level == 0 && g_np.backlog_warn_level > 0) {
+        fprintf(stderr,
+                "snes_netplay: host_authority backlog recovered (%d frames) "
+                "sim=%u catchup_total=%u\n",
+                st.auth_backlog, (unsigned)st.sim_tick,
+                (unsigned)g_np.catchup_frames_total);
+    }
+    g_np.backlog_warn_level = level;
+}
+
+/* A host-authority guest that can no longer be fed: it has waited 3 s for the
+ * host's next row while the host is alive and either rows beyond its window
+ * keep being refused or later rows are here without the one it needs. The
+ * host's ring no longer holds that row, so the wait would never end -- the
+ * "frozen / black screen" guest. Leave the match with a reason instead. */
+int snes_netplay_auth_guest_lost(void)
+{
+    RNetSessionStats st;
+    if (!snes_netplay_host_authority_guest() || g_np.spectator)
+        return 0;
+    memset(&st, 0, sizeof(st));
+    rnet_session_get_stats(g_np.session, &st);
+    if (!st.is_running || st.last_stall != RNET_ADMIT_WAIT_REMOTE_INPUT ||
+        st.consecutive_stalls == 0) {
+        g_np.auth_lost_since_ms = 0;
+        return 0;
+    }
+    if (!g_np.auth_lost_since_ms) {
+        g_np.auth_lost_since_ms = np_diagnostic_clock_ms();
+        g_np.auth_lost_dropped = st.auth_rows_dropped;
+        return 0;
+    }
+    if (np_diagnostic_clock_ms() - g_np.auth_lost_since_ms < 3000u)
+        return 0;
+    if (st.last_peer_rx_age_ms > 1000u)
+        return 0; /* host silent: the peer-timeout path owns this */
+    if (st.auth_rows_dropped == g_np.auth_lost_dropped &&
+        st.remote_lead <= (int)st.delay + 4)
+        return 0; /* no evidence the row is gone for good: keep waiting */
+    fprintf(stderr,
+            "snes_netplay: host_authority guest LOST sim=%u remote_lead=%d "
+            "rows_dropped=%u (+%u in 3 s) resend_rows=%u stall_ms=%u "
+            "peer_rx_age_ms=%llu -- the host no longer holds the row this "
+            "guest needs; leaving the match\n",
+            (unsigned)st.sim_tick, st.remote_lead,
+            (unsigned)st.auth_rows_dropped,
+            (unsigned)(st.auth_rows_dropped - g_np.auth_lost_dropped),
+            (unsigned)st.auth_resend_rows, (unsigned)st.last_admit_wait_ms,
+            (unsigned long long)st.last_peer_rx_age_ms);
+    fflush(stderr);
+    g_np.auth_lost_since_ms = 0;
+    return 1;
+}
+
 void snes_netplay_diag_tick(void)
 {
     RNetSessionStats st;
@@ -2599,26 +2777,24 @@ void snes_netplay_diag_tick(void)
         return;
     g_diag_last_write_ms = now ? now : 1u;
 
-    if (!g_diag_mkdir_done) {
-        g_diag_mkdir_done = 1;
-#ifdef _WIN32
-        _mkdir("saves");
-        _mkdir("saves\\netplay");
-#else
-        mkdir("saves", 0755);
-        mkdir("saves/netplay", 0755);
-#endif
-    }
+    np_diag_mkdirs();
 
     if (!g_diag_file || g_diag_file_session != g_np.diag_session) {
-        char pathbuf[64];
+        char pathbuf[96];
+        char stamp[32];
+        time_t wall = time(NULL);
+        struct tm *lt = localtime(&wall);
         if (g_diag_file) {
             fclose(g_diag_file);
             g_diag_file = NULL;
         }
-        /* Single shared path; truncate on each new match so the summary
-         * stays at the top (same-machine dual clients will overwrite). */
-        snprintf(pathbuf, sizeof(pathbuf), "saves/netplay/net_diag.jsonl");
+        /* One file per match, named by local start time and role, so a
+         * second match (or the other peer on the same machine) does not
+         * overwrite the evidence of the first; the summary leads each file. */
+        if (!lt || !strftime(stamp, sizeof(stamp), "%Y%m%d_%H%M%S", lt))
+            snprintf(stamp, sizeof(stamp), "%u", (unsigned)now);
+        snprintf(pathbuf, sizeof(pathbuf), "saves/netplay/net_diag_%s_%s_slot%d.jsonl",
+                 stamp, g_np.is_host ? "host" : "guest", g_np.local_slot);
         g_diag_file = fopen(pathbuf, "wb");
         if (!g_diag_file)
             return;
@@ -2657,7 +2833,12 @@ void snes_netplay_diag_tick(void)
                 "\"consec_stalls\":%u,\"admit_ok\":%u,\"remote_lead\":%d,"
                 "\"remote_wire\":%u,\"peer_rx_age_ms\":%llu,\"peer_gone\":%d,"
                 "\"desync\":%d,\"desync_tick\":%u,\"state_busy\":%d,\"state_op\":%u,"
-                "\"pkts_rx\":%u,\"input_sends\":%u}\n",
+                "\"pkts_rx\":%u,\"input_sends\":%u,"
+                "\"is_host\":%d,\"host_authority\":%d,\"backlog\":%d,"
+                "\"resend_rows\":%u,\"rows_dropped\":%u,"
+                "\"frames\":%u,\"catchup\":%u,\"catchup_total\":%u,"
+                "\"presents\":%u,\"frame_ms_avg\":%.2f,\"frame_ms_max\":%.2f,"
+                "\"pump_gap_max_ms\":%llu,\"pump_dur_max_ms\":%llu}\n",
                 (unsigned)now, g_np.local_slot, transport ? transport : "none",
                 ice_state ? ice_state : "idle", path, np_diag_ice_nat(path),
                 using_turn_path, ice_local_esc, ice_remote_esc, st.is_running,
@@ -2670,7 +2851,17 @@ void snes_netplay_diag_tick(void)
                 (unsigned long long)st.last_peer_rx_age_ms, st.peer_gone,
                 st.input_desync, (unsigned)st.desync_tick, st.state_busy,
                 (unsigned)st.state_op, (unsigned)st.packets_rx,
-                (unsigned)st.input_bundle_sends);
+                (unsigned)st.input_bundle_sends,
+                g_np.is_host, st.host_authority, st.auth_backlog,
+                (unsigned)st.auth_resend_rows, (unsigned)st.auth_rows_dropped,
+                (unsigned)g_np.diag_frames, (unsigned)g_np.diag_catchup_frames,
+                (unsigned)g_np.catchup_frames_total, (unsigned)g_np.diag_presents,
+                g_np.diag_frames ? g_np.diag_frame_ms_sum / g_np.diag_frames : 0.0,
+                g_np.diag_frame_ms_max,
+                (unsigned long long)g_np.timing.max_gap_ms,
+                (unsigned long long)g_np.timing.max_duration_ms);
+        g_np.diag_frames = g_np.diag_catchup_frames = g_np.diag_presents = 0;
+        g_np.diag_frame_ms_sum = g_np.diag_frame_ms_max = 0;
     }
 }
 
@@ -2793,6 +2984,7 @@ void snes_netplay_finish_frame(void)
     g_np.needs_advance = 0;
     g_np.latched_for_tick = 0;
     g_np.frames_finished++;
+    np_auth_watch();
 }
 
 int snes_netplay_remote_lead(void)

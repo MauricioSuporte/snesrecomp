@@ -4401,6 +4401,7 @@ error_reading:;
         int burst = 0;
         for (;;) {
           uint32 inputs = snes_netplay_published_inputs() | snes_netplay_active_mask();
+          double net_frame_t0 = MonotonicSeconds();
           g_profile_frame = frameCtr + 1;
           double profile_start = ProfileStart();
           if (game->before_run_frame) game->before_run_frame();
@@ -4423,6 +4424,7 @@ error_reading:;
           NoteStateFrame();
           ProfileEnd(kProfileRaster, profile_start);
           snes_netplay_finish_frame();
+          snes_netplay_note_frame((MonotonicSeconds() - net_frame_t0) * 1000.0, burst > 0);
           if (run_frames && frameCtr >= run_frames) {
             running = false;
             exit_reason = "RUN_FRAMES reached";
@@ -4447,6 +4449,7 @@ error_reading:;
       if (snes_savestate_menu_is_open()) PresentFrozenWithOverlay();
       else DrawPpuFrameWithPerf();
       ++presentations;
+      snes_netplay_note_present();
       continue;
     }
 #endif /* SNES_HAS_LOBBY_CLIENT */
