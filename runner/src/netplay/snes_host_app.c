@@ -22,6 +22,13 @@ void snes_host_app_apply_launch(const RecompLauncherCNetplayLaunch *net,
   snes_netplay_config_defaults(&out->net_cfg);
   out->net_cfg.enabled = 1;
   out->net_cfg.local_slot = net->local_slot;
+  /* The match's seat count. It used to be left at the config default of
+   * two, so a lobby launch with three or more players opened a two-seat
+   * session: the host found no ICE agent for its own slot ("no connected
+   * agents to take (slot 0 of 2)") and never started, and every guest sat
+   * behind a black screen. SNES_NET_SLOTS (apply_env below) still wins. */
+  if (net->player_count >= 2)
+    out->net_cfg.slot_count = net->player_count;
   out->net_cfg.spectator = net->is_spectator ? 1 : 0;
   out->net_cfg.spectator_wire_slot = net->spectator_wire_slot;
   out->net_cfg.input_player =
