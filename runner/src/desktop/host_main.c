@@ -2502,8 +2502,35 @@ static void NetplayMenuSelftest(uint32_t frame) {
   }
 }
 
+/* Validation knob: SNESRECOMP_NET_TEST_INPUT=<seed> replaces this peer's
+ * local pad with a deterministic pseudo-random stream (held for 8 captures
+ * at a time, Start and A often enough to leave menus), so a headless pair can
+ * exercise real gameplay without an input script, which netplay refuses. */
+static int netplay_test_input(uint16_t *out) {
+  static int seed = -1;
+  static uint32_t calls, state;
+  static uint16_t held;
+  if (seed < 0) {
+    const char *v = getenv("SNESRECOMP_NET_TEST_INPUT");
+    seed = v && v[0] ? (int)(strtoul(v, NULL, 10) & 0x7fffffff) : 0;
+    state = 2463534242u ^ (uint32_t)seed;
+  }
+  if (!seed) return 0;
+  if ((calls++ & 7u) == 0) {
+    state ^= state << 13; state ^= state >> 17; state ^= state << 5;
+    held = (uint16_t)(state & 0x0ff0u);                  /* directions, A..R */
+    if ((state >> 20) % 4u == 0) held |= 0x0001u;        /* B: bombs */
+    if ((state >> 24) % 23u == 0) held |= 0x0008u;       /* Start */
+  }
+  *out = held;
+  return 1;
+}
+
 static uint16_t netplay_capture_pad(void *ctx) {
+  uint16_t test_pad;
   (void)ctx;
+  if (netplay_test_input(&test_pad))
+    return test_pad;
   PollKeyboardControls(snesrecomp_sdl_get_keyboard_state());
   const unsigned player = snes_netplay_input_player() == 1 ? 1 : 0;
   return (uint16_t)snes_savestate_menu_filter_guest_input(
