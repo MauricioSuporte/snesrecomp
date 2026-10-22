@@ -611,6 +611,13 @@ void ppu_rasterApplyLine(Ppu *ppu, int line);
 void ppu_rasterFieldBoundary(void);
 /* Disarm, for a machine rebuild (session reset). */
 void ppu_rasterReset(void);
+/* The journal is host state: the register file at each field's start and the
+ * writes since. A rollback that restores the machine without it renders (and
+ * leaves in the PPU) the abandoned timeline's field. In-process snapshots
+ * only; save returns bytes written (0 = no room), load returns 1 on success. */
+size_t ppu_raster_state_bound(void);
+size_t ppu_raster_state_save(void *out, size_t capacity);
+int ppu_raster_state_load(const void *in, size_t size);
 
 /* Scanout latch bypass — set by the debug server around render_inject so an
  * injected OAM/CGRAM state is rendered as given. A frame-model host that

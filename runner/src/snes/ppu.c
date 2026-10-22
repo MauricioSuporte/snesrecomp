@@ -3244,6 +3244,77 @@ void ppu_rasterReset(void) {
   s_raster_hdmaen_pending = 0;
 }
 
+#define PPU_RASTER_STATE_MAGIC 0x31534152u /* "RAS1" */
+typedef struct {
+  uint32_t magic;
+  int32_t cur, armed, have_completed;
+} PpuRasterStateHeader;
+#define PPU_RASTER_FIELD_HEAD offsetof(PpuRasterField, e)
+
+size_t ppu_raster_state_bound(void) {
+  return sizeof(PpuRasterStateHeader) + 2u * sizeof(PpuRasterField);
+}
+
+size_t ppu_raster_state_save(void *out, size_t capacity) {
+  PpuRasterStateHeader h;
+  uint8_t *b = (uint8_t *)out;
+  size_t used = sizeof(h);
+  int i;
+  if (!out || capacity < used)
+    return 0;
+  h.magic = PPU_RASTER_STATE_MAGIC;
+  h.cur = s_raster_cur;
+  h.armed = s_raster_armed;
+  h.have_completed = s_raster_have_completed;
+  memcpy(b, &h, sizeof(h));
+  for (i = 0; i < 2; ++i) {
+    const PpuRasterField *f = &s_field[i];
+    size_t n = PPU_RASTER_FIELD_HEAD + (size_t)f->count * sizeof(PpuRasterEntry);
+    if (f->count < 0 || f->count > PPU_RASTER_MAX || capacity - used < n)
+      return 0;
+    memcpy(b + used, f, n);
+    used += n;
+  }
+  return used;
+}
+
+int ppu_raster_state_load(const void *in, size_t size) {
+  PpuRasterStateHeader h;
+  const uint8_t *b = (const uint8_t *)in;
+  size_t used = sizeof(h);
+  PpuRasterField head[2];
+  size_t at[2];
+  int i;
+  if (!in || size < used)
+    return 0;
+  memcpy(&h, b, sizeof(h));
+  if (h.magic != PPU_RASTER_STATE_MAGIC || (h.cur != 0 && h.cur != 1))
+    return 0;
+  for (i = 0; i < 2; ++i) {
+    if (size - used < PPU_RASTER_FIELD_HEAD)
+      return 0;
+    memcpy(&head[i], b + used, PPU_RASTER_FIELD_HEAD);
+    if (head[i].count < 0 || head[i].count > PPU_RASTER_MAX ||
+        size - used - PPU_RASTER_FIELD_HEAD < (size_t)head[i].count * sizeof(PpuRasterEntry))
+      return 0;
+    at[i] = used;
+    used += PPU_RASTER_FIELD_HEAD + (size_t)head[i].count * sizeof(PpuRasterEntry);
+  }
+  if (used != size)
+    return 0;
+  for (i = 0; i < 2; ++i)
+    memcpy(&s_field[i], b + at[i],
+           PPU_RASTER_FIELD_HEAD + (size_t)head[i].count * sizeof(PpuRasterEntry));
+  s_raster_cur = h.cur;
+  s_raster_armed = h.armed != 0;
+  s_raster_have_completed = h.have_completed != 0;
+  s_raster_rendering = 0;
+  s_raster_render = NULL;
+  s_raster_next = 0;
+  s_raster_hdmaen_pending = 0;
+  return 1;
+}
+
 void ppu_rasterRecord(uint16_t reg, uint16_t line, uint8_t val) {
   PpuRasterField *f;
   if (!s_raster_armed || s_raster_rendering || !raster_reg_journaled(reg))

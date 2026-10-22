@@ -271,30 +271,39 @@ void snes_beam_frame_driver_reset(void) {
   s_wai_halted = false;
 }
 
-/* [magic u32][resume pc u32][wai u8] -- in-process rollback only. */
-#define BFD_EXEC_MAGIC 0x31444642u /* "BFD1" */
-#define BFD_EXEC_SIZE 9u
+/* [magic u32][resume pc u32][wai u8][raster journal] -- in-process rollback
+ * only. The journal rides here because this driver owns its render loop:
+ * restoring a machine with another timeline's journal draws that timeline's
+ * field and leaves its register file in the PPU. */
+#define BFD_EXEC_MAGIC 0x32444642u /* "BFD2" */
+#define BFD_EXEC_HEAD 9u
 
-size_t snes_beam_frame_driver_exec_state_bound(void) { return BFD_EXEC_SIZE; }
+size_t snes_beam_frame_driver_exec_state_bound(void) {
+  return BFD_EXEC_HEAD + ppu_raster_state_bound();
+}
 
 size_t snes_beam_frame_driver_exec_state_save(void *out, size_t capacity) {
   uint8_t *b = (uint8_t *)out;
   uint32_t magic = BFD_EXEC_MAGIC;
-  if (!out || capacity < BFD_EXEC_SIZE)
+  size_t raster;
+  if (!out || capacity < BFD_EXEC_HEAD)
     return 0;
   memcpy(b, &magic, 4);
   memcpy(b + 4, &s_resume_pc, 4);
   b[8] = s_wai_halted ? 1 : 0;
-  return BFD_EXEC_SIZE;
+  raster = ppu_raster_state_save(b + BFD_EXEC_HEAD, capacity - BFD_EXEC_HEAD);
+  return raster ? BFD_EXEC_HEAD + raster : 0;
 }
 
 int snes_beam_frame_driver_exec_state_load(const void *in, size_t size) {
   const uint8_t *b = (const uint8_t *)in;
   uint32_t magic;
-  if (!in || size != BFD_EXEC_SIZE)
+  if (!in || size <= BFD_EXEC_HEAD)
     return 0;
   memcpy(&magic, b, 4);
   if (magic != BFD_EXEC_MAGIC || b[8] > 1)
+    return 0;
+  if (!ppu_raster_state_load(b + BFD_EXEC_HEAD, size - BFD_EXEC_HEAD))
     return 0;
   memcpy(&s_resume_pc, b + 4, 4);
   s_wai_halted = b[8] != 0;
