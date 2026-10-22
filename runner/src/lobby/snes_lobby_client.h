@@ -36,9 +36,10 @@ extern "C" {
 #define SNES_LOBBY_VERSION_LEN        RNET_LOBBY_VERSION_LEN
 #define SNES_LOBBY_ENDPOINT_LEN       RNET_LOBBY_ENDPOINT_LEN
 #define SNES_LOBBY_MAX_LIST           RNET_LOBBY_MAX_LIST
-/* The SNES title ceiling (what create() is clamped to). The client's arrays
- * are RNET_LOBBY_MAX_PLAYERS wide. */
-#define SNES_LOBBY_MAX_PLAYERS        4
+/* The SNES ceiling (what create() is clamped to): every seat recomp-net
+ * carries. A title asks for its own count through num_players (two
+ * multitaps reach eight), so a five-seat game gets five-seat rooms. */
+#define SNES_LOBBY_MAX_PLAYERS        RNET_LOBBY_MAX_PLAYERS
 #define SNES_LOBBY_MAX_SPECTATORS     RNET_LOBBY_MAX_SPECTATORS
 #define SNES_LOBBY_MAX_MEMBERS        RNET_LOBBY_MAX_MEMBERS
 #define SNES_LOBBY_SPECTATOR_SLOT_BASE RNET_LOBBY_SPECTATOR_SLOT_BASE
