@@ -880,6 +880,16 @@ int snes_netplay_start(const SnesNetplayConfig *cfg)
     rcfg.input_delay = (rnet_u8)(cfg->input_delay < 0 ? 0
                                 : (cfg->input_delay > 20 ? 20 : cfg->input_delay));
     rcfg.session_id = cfg->session_id ? cfg->session_id : 1u;
+    /* Host-authoritative delay-sync (recomp-net RNetConfig.host_authority):
+     * seat 0 never waits and sends every tick's resolved row; guests follow
+     * it, lagging by their latency instead of stalling the match. Delay-sync
+     * only, and every peer must set it (a title that wants it sets the env on
+     * every peer, as Super Bomberman 5 does). */
+    {
+        const char *ha = getenv("SNES_NET_HOST_AUTHORITY");
+        if (ha && ha[0] && ha[0] != '0' && !cfg->rollback)
+            rcfg.host_authority = 1;
+    }
 
     /* Host resolves auto (-1) before start; accept only 0/1 here. */
     in_player = (cfg->input_player == 1) ? 1 : 0;
@@ -1231,9 +1241,10 @@ int snes_netplay_start(const SnesNetplayConfig *cfg)
 
     fprintf(stderr,
             "snes_netplay: started transport=%s slot=%d input_player=%d session=%u "
-            "delay=%u force_input_relay=%d bind=%s peer=%s\n",
+            "delay=%u host_authority=%d force_input_relay=%d bind=%s peer=%s\n",
             snes_netplay_transport_name(), g_np.local_slot, g_np.input_player,
             (unsigned)rcfg.session_id, (unsigned)rcfg.input_delay,
+            (int)rcfg.host_authority,
             g_np.force_input_relay, cfg->bind_hostport,
             /* Lobby peer rewrite is unused for ICE (candidates via WS). */
             use_ice ? "(ice)" : cfg->peer_hostport);
