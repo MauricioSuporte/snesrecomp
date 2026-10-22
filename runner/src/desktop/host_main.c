@@ -3529,15 +3529,15 @@ int snesrecomp_desktop_main(const SnesDesktopHostGame *game, int argc, char **ar
          * file-picker self-test also reports UNAVAILABLE; leave it alone. */
         if (act == RECOMP_LAUNCHER_RESULT_UNAVAILABLE &&
             !getenv("RECOMP_UI_PICKER_SELFTEST"))
-          Die("The launcher window could not open. It needs OpenGL 3.3, "
-              "which this computer's graphics driver usually lacks when "
-              "this happens.\n\n"
+          Die("The launcher window could not open. It needs OpenGL 3.0 or "
+              "newer, which this computer's graphics driver usually lacks "
+              "when this happens.\n\n"
               "Install or update the graphics card driver from the GPU "
               "maker (NVIDIA, AMD or Intel). Windows' generic \"Microsoft "
               "Basic Display Adapter\" only offers OpenGL 1.1.\n\n"
-              "Older GPUs without OpenGL 3.3 can use a software OpenGL "
-              "driver (Mesa3D for Windows, opengl32.dll) placed beside "
-              "this executable.");
+              "GPUs without OpenGL 3.0 can use a software OpenGL driver "
+              "(Mesa3D for Windows, opengl32.dll) placed beside this "
+              "executable.");
 #endif
       }
     }
