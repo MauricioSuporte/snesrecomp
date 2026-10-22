@@ -2502,27 +2502,43 @@ static void NetplayMenuSelftest(uint32_t frame) {
   }
 }
 
-/* Validation knob: SNESRECOMP_NET_TEST_INPUT=<seed> replaces this peer's
- * local pad with a deterministic pseudo-random stream (held for 8 captures
- * at a time, Start and A often enough to leave menus), so a headless pair can
- * exercise real gameplay without an input script, which netplay refuses. */
+/* Validation knobs for headless pairs (netplay refuses input scripts):
+ * SNESRECOMP_NET_TEST_INPUT_SCRIPT=<file> of "<frames> <pad hex>" lines is
+ * played first, keyed to the guest frame counter, then
+ * SNESRECOMP_NET_TEST_INPUT=<seed> replaces this peer's local pad with a
+ * deterministic pseudo-random stream (8 frames per pattern; B, Start and
+ * A..R, never Select). Unset, the real pads are used. */
+extern int snes_frame_counter;
 static int netplay_test_input(uint16_t *out) {
-  static int seed = -1;
-  static uint32_t calls, state;
-  static uint16_t held;
-  if (seed < 0) {
+  static int loaded, seed, count;
+  static unsigned ends[512];
+  static uint16_t pads[512];
+  unsigned frame = (unsigned)snes_frame_counter;
+  if (!loaded) {
     const char *v = getenv("SNESRECOMP_NET_TEST_INPUT");
+    const char *path = getenv("SNESRECOMP_NET_TEST_INPUT_SCRIPT");
+    FILE *f = path && path[0] ? fopen(path, "r") : NULL;
+    unsigned total = 0, n, value;
+    loaded = 1;
     seed = v && v[0] ? (int)(strtoul(v, NULL, 10) & 0x7fffffff) : 0;
-    state = 2463534242u ^ (uint32_t)seed;
+    while (f && count < 512 && fscanf(f, "%u %x", &n, &value) == 2) {
+      total += n;
+      ends[count] = total;
+      pads[count++] = (uint16_t)(value & 0x0fffu);
+    }
+    if (f) fclose(f);
   }
-  if (!seed) return 0;
-  if ((calls++ & 7u) == 0) {
-    state ^= state << 13; state ^= state >> 17; state ^= state << 5;
-    held = (uint16_t)(state & 0x0ff0u);                  /* directions, A..R */
-    if ((state >> 20) % 4u == 0) held |= 0x0001u;        /* B: bombs */
-    if ((state >> 24) % 23u == 0) held |= 0x0008u;       /* Start */
+  for (int i = 0; i < count; ++i)
+    if (frame < ends[i]) { *out = pads[i]; return 1; }
+  if (!seed) return count ? (*out = 0, 1) : 0;
+  {
+    uint32_t x = (frame / 8u) * 2654435761u ^ (uint32_t)seed * 40503u ^ 2463534242u;
+    x ^= x << 13; x ^= x >> 17; x ^= x << 5;
+    uint16_t held = (uint16_t)(x & 0x0ff0u);
+    if ((x >> 20) % 4u == 0) held |= 0x0001u;
+    if ((x >> 24) % 23u == 0) held |= 0x0008u;
+    *out = held;
   }
-  *out = held;
   return 1;
 }
 
