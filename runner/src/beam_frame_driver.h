@@ -29,4 +29,13 @@ void snes_beam_frame_driver_draw_ppu_frame_observed(
 /* Forget the booted machine: the next frame starts from the reset vector. */
 void snes_beam_frame_driver_reset(void);
 
+/* The driver's own execution position (the PC the next field resumes at and
+ * the WAI latch) lives outside guest memory. A rollback snapshot that omits
+ * it replays the first frame from the future's resume point. Titles using
+ * this driver wire these into RtlGameInfo.exec_state_bound/save/load. */
+#include <stddef.h>
+size_t snes_beam_frame_driver_exec_state_bound(void);
+size_t snes_beam_frame_driver_exec_state_save(void *out, size_t capacity);
+int snes_beam_frame_driver_exec_state_load(const void *in, size_t size);
+
 #endif /* SNESRECOMP_BEAM_FRAME_DRIVER_H */

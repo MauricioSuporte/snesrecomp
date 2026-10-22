@@ -10,6 +10,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <string.h>
 
 #include "common_cpu_infra.h"
 #include "common_rtl.h"
@@ -268,4 +269,34 @@ void snes_beam_frame_driver_draw_ppu_frame_observed(
 void snes_beam_frame_driver_reset(void) {
   s_resume_pc = 0;
   s_wai_halted = false;
+}
+
+/* [magic u32][resume pc u32][wai u8] -- in-process rollback only. */
+#define BFD_EXEC_MAGIC 0x31444642u /* "BFD1" */
+#define BFD_EXEC_SIZE 9u
+
+size_t snes_beam_frame_driver_exec_state_bound(void) { return BFD_EXEC_SIZE; }
+
+size_t snes_beam_frame_driver_exec_state_save(void *out, size_t capacity) {
+  uint8_t *b = (uint8_t *)out;
+  uint32_t magic = BFD_EXEC_MAGIC;
+  if (!out || capacity < BFD_EXEC_SIZE)
+    return 0;
+  memcpy(b, &magic, 4);
+  memcpy(b + 4, &s_resume_pc, 4);
+  b[8] = s_wai_halted ? 1 : 0;
+  return BFD_EXEC_SIZE;
+}
+
+int snes_beam_frame_driver_exec_state_load(const void *in, size_t size) {
+  const uint8_t *b = (const uint8_t *)in;
+  uint32_t magic;
+  if (!in || size != BFD_EXEC_SIZE)
+    return 0;
+  memcpy(&magic, b, 4);
+  if (magic != BFD_EXEC_MAGIC || b[8] > 1)
+    return 0;
+  memcpy(&s_resume_pc, b + 4, 4);
+  s_wai_halted = b[8] != 0;
+  return 1;
 }
