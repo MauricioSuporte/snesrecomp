@@ -1210,24 +1210,60 @@ static int host_prepare_generate(const char* source_path, char* out_path,
  * arrived as "┴rea de Trabalho" and the rebuild could not find its source.
  * Paths are written in the OEM code page; one it cannot spell falls back to
  * its 8.3 short name. (Switching the helper to chcp 65001 instead left the
- * rebuild console closing before configure on Windows 11.) */
+ * rebuild console closing before configure on Windows 11.)
+ *
+ * The UTF-8 activeCodePage manifest makes GetOEMCP() (and CP_OEMCP) answer
+ * 65001 inside this process, while the console that runs the helper still
+ * uses the system OEM code page (850 on Portuguese Windows): the helper then
+ * spelled "Área" as UTF-8 and cmd.exe linked the build junction to a folder
+ * that does not exist. Ask the system for the console's code page instead. */
+static UINT bat_codepage(void) {
+    HKEY key;
+    WCHAR value[16];
+    DWORD size = sizeof(value), type = 0;
+    UINT cp = 0;
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,
+                      L"SYSTEM\\CurrentControlSet\\Control\\Nls\\CodePage", 0,
+                      KEY_QUERY_VALUE, &key) == ERROR_SUCCESS) {
+        if (RegQueryValueExW(key, L"OEMCP", NULL, &type, (LPBYTE)value,
+                             &size) == ERROR_SUCCESS &&
+            type == REG_SZ && size >= sizeof(WCHAR)) {
+            value[sizeof(value) / sizeof(value[0]) - 1] = 0;
+            cp = (UINT)wcstoul(value, NULL, 10);
+        }
+        RegCloseKey(key);
+    }
+    if (cp == 0 || !IsValidCodePage(cp)) {
+        DWORD lcp = 0;
+        if (GetLocaleInfoEx(LOCALE_NAME_SYSTEM_DEFAULT,
+                            LOCALE_IDEFAULTCODEPAGE | LOCALE_RETURN_NUMBER,
+                            (LPWSTR)&lcp, sizeof(lcp) / sizeof(WCHAR)) > 0 &&
+            lcp != 0 && IsValidCodePage((UINT)lcp))
+            cp = (UINT)lcp;
+    }
+    return cp ? cp : CP_OEMCP;
+}
+
 static const char* bat_text(const char* ansi, char* out, size_t cap) {
     WCHAR wide[2048];
     WCHAR shortw[2048];
     const WCHAR* src = wide;
     BOOL lossy = FALSE;
+    const UINT cp = bat_codepage();
+    /* WC_NO_BEST_FIT_CHARS / lossy reporting are invalid for UTF-8. */
+    const DWORD flags = cp == CP_UTF8 ? 0 : WC_NO_BEST_FIT_CHARS;
     if (MultiByteToWideChar(CP_ACP, 0, ansi, -1, wide,
                             (int)(sizeof(wide) / sizeof(wide[0]))) <= 0)
         return ansi;
-    if (WideCharToMultiByte(CP_OEMCP, WC_NO_BEST_FIT_CHARS, src, -1, out,
-                            (int)cap, NULL, &lossy) > 0 && !lossy)
+    if (WideCharToMultiByte(cp, flags, src, -1, out, (int)cap, NULL,
+                            cp == CP_UTF8 ? NULL : &lossy) > 0 && !lossy)
         return out;
     DWORD n = GetShortPathNameW(wide, shortw,
                                 (DWORD)(sizeof(shortw) / sizeof(shortw[0])));
     if (n > 0 && n < sizeof(shortw) / sizeof(shortw[0])) {
         lossy = FALSE;
-        if (WideCharToMultiByte(CP_OEMCP, WC_NO_BEST_FIT_CHARS, shortw, -1,
-                                out, (int)cap, NULL, &lossy) > 0 && !lossy)
+        if (WideCharToMultiByte(cp, flags, shortw, -1, out, (int)cap, NULL,
+                                cp == CP_UTF8 ? NULL : &lossy) > 0 && !lossy)
             return out;
     }
     return ansi;
@@ -1288,6 +1324,11 @@ static void bat_write_ascii_alias(FILE* f) {
             *p = '/';
     bat_write_set(f, "ALIAS", alias);
     bat_write_set(f, "ALIAS_FWD", fwd);
+    /* A junction left by an earlier helper can point at a folder that no
+     * longer exists (moved install, or a path spelled in the wrong code
+     * page): drop it so it is linked again. rmdir removes only the link. */
+    fprintf(f, "if exist \"%%ALIAS%%\\\" if not exist \"%%ALIAS%%\\CMakeLists.txt\" "
+               "rmdir \"%%ALIAS%%\" 2>NUL\r\n");
     fprintf(f, "if not exist \"%%ALIAS%%\\\" (\r\n"
                "  rmdir \"%%ALIAS%%\" 2>NUL\r\n"
                "  mkdir \"");
