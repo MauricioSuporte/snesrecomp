@@ -117,6 +117,10 @@
 #if defined(SNESRECOMP_NET_ROLLBACK)
 #include "netplay/snes_netplay_rb.h"
 #endif
+#if defined(SNES_HOST_HAS_INGAME_CHAT)
+#include "host_chat.h"          /* the room chat inside the running game */
+#include "recomp_moderation.h"  /* the launcher's ignore list hides lines here too */
+#endif
 #endif
 
 /* ─────────────────────────────────────────────────────────────────────────── */
@@ -2240,6 +2244,252 @@ static bool SdlRenderer_Init(SDL_Window *window) {
   return true;
 }
 
+/* ── In-game room chat (host_chat.c) ─────────────────────────────────────
+ * During a netplay match: T opens a text bar bottom-left, Enter sends to the
+ * room (the launcher's lobby chat, still pumped by the session) and closes,
+ * Escape closes. New lines pop up for five seconds. While the bar is open
+ * -- and afterwards until every key is released -- the KEYBOARD pad sent to
+ * the session is neutral; a gamepad keeps playing. */
+#if defined(SNES_HAS_LOBBY_CLIENT) && defined(SNES_HOST_HAS_INGAME_CHAT)
+static bool g_chat_text_input;
+static bool g_chat_hold_keyboard;
+static bool g_chat_font_tried;
+static double g_chat_skip_open_char_until = -1.0;
+
+static int chat_src_send(void *ctx, const char *text) {
+  const RecompLauncherCNetplayCallbacks *np = snes_host_lobby_callbacks();
+  (void)ctx;
+  return np && np->chat_send ? np->chat_send(np->ctx, text) : -1;
+}
+
+static int chat_src_count(void *ctx) {
+  const RecompLauncherCNetplayCallbacks *np = snes_host_lobby_callbacks();
+  (void)ctx;
+  return np && np->chat_count && np->chat_get ? np->chat_count(np->ctx) : 0;
+}
+
+static int chat_src_get(void *ctx, int index, HostChatLine *out) {
+  const RecompLauncherCNetplayCallbacks *np = snes_host_lobby_callbacks();
+  RecompLauncherCNetplayChatMessage m;
+  (void)ctx;
+  if (!np || !np->chat_get) return 0;
+  memset(&m, 0, sizeof(m));
+  if (!np->chat_get(np->ctx, index, &m)) return 0;
+  memset(out, 0, sizeof(*out));
+  snprintf(out->from, sizeof(out->from), "%s", m.from);
+  snprintf(out->text, sizeof(out->text), "%s", m.text);
+  snprintf(out->account, sizeof(out->account), "%s", m.account);
+  out->is_local = m.is_local;
+  out->is_system = m.is_system;
+  out->seq = m.seq;
+  return 1;
+}
+
+static int chat_src_hidden(void *ctx, const HostChatLine *line) {
+  (void)ctx;
+  return line->account[0] && !line->is_local &&
+         recomp_moderation_is_ignored(line->account);
+}
+
+static void HostChatSetTextInput(bool on) {
+#if SNESRECOMP_SDL3
+  if (on) SDL_StartTextInput(g_window); else SDL_StopTextInput(g_window);
+#else
+  if (on) SDL_StartTextInput(); else SDL_StopTextInput();
+#endif
+  g_chat_text_input = on;
+}
+
+static int HostChatOverlay(int dw, int dh, const int frame_rect[4], int frame_w,
+                           int frame_h, const SnesWindowOverlayQuad **out) {
+  static SnesWindowOverlayQuad quads[SNES_GL_OVERLAY_SLOTS];
+  const HostOverlayQuad *q = NULL;
+  int n = host_chat_overlay(dw, dh, frame_rect, frame_w, frame_h, MonotonicSeconds(), &q);
+  if (n > SNES_GL_OVERLAY_SLOTS) n = SNES_GL_OVERLAY_SLOTS;
+  for (int i = 0; i < n; ++i) {
+    quads[i].px = q[i].px;
+    quads[i].x = q[i].x; quads[i].y = q[i].y;
+    quads[i].w = q[i].w; quads[i].h = q[i].h;
+    quads[i].generation = q[i].generation;
+    quads[i].slot = q[i].slot;
+  }
+  *out = quads;
+  return n;
+}
+
+/* Seat names for the name tags: the room's players by lobby seat, which is
+ * the session slot and the controller port in this engine. Spectators have
+ * no seat. A room whose host watches from the gallery (host_spectates) puts
+ * players at lobby seat + 1; tags then follow the lobby seat, a known gap. SNESRECOMP_NET_TEST_NAMES="A,B,..." names seats for headless
+ * loopback peers, which have no lobby. */
+static void HostChatUpdateSeatNames(void) {
+  const RecompLauncherCNetplayCallbacks *np = snes_host_lobby_callbacks();
+  char names[HOST_CHAT_MAX_SEATS][HOST_CHAT_NAME_LEN];
+  int found = 0;
+  memset(names, 0, sizeof(names));
+  if (np && np->member_count && np->member_get) {
+    const int count = np->member_count(np->ctx);
+    for (int i = 0; i < count; ++i) {
+      RecompLauncherCNetplayMember m;
+      memset(&m, 0, sizeof(m));
+      if (!np->member_get(np->ctx, i, &m) || m.is_spectator) continue;
+      /* Seats of the running session only: someone who joins mid-match sits
+       * in the room for the chat and plays from the next match. */
+      if (m.slot < 0 || m.slot >= HOST_CHAT_MAX_SEATS || m.slot >= snes_netplay_slot_count() ||
+          !m.display_name[0])
+        continue;
+      snprintf(names[m.slot], sizeof(names[m.slot]), "%s", m.display_name);
+      found++;
+    }
+  }
+  if (!found) {
+    const char *test = HostGetenv("NET_TEST_NAMES");
+    int seat = 0;
+    for (const char *p = test; p && *p && seat < HOST_CHAT_MAX_SEATS; ++seat) {
+      const char *e = strchr(p, ',');
+      size_t len = e ? (size_t)(e - p) : strlen(p);
+      if (len >= HOST_CHAT_NAME_LEN) len = HOST_CHAT_NAME_LEN - 1;
+      memcpy(names[seat], p, len);
+      names[seat][len] = '\0';
+      p = e ? e + 1 : p + len;
+    }
+  }
+  for (int i = 0; i < HOST_CHAT_MAX_SEATS; ++i) host_chat_set_seat_name(i, names[i]);
+}
+
+/* Once per host frame, netplay or not: an inactive tick ends the session. */
+static void HostChatFrame(void) {
+  static const HostChatSource src = {
+    NULL, chat_src_send, chat_src_count, chat_src_get, chat_src_hidden,
+  };
+  const bool active = g_netplay_session && snes_netplay_active();
+  if (active && !g_chat_font_tried) {
+    static const char *const kFonts[] = {
+      "assets/fonts/LatoLatin-Bold.ttf", "assets/fonts/LatoLatin-Regular.ttf",
+    };
+    char path[1024];
+    g_chat_font_tried = true;
+    for (size_t i = 0; i < sizeof(kFonts) / sizeof(kFonts[0]) && !host_chat_font_loaded(); ++i) {
+      if (snesrecomp_exe_dir_path(kFonts[i], path, sizeof(path)) && host_chat_load_font(path))
+        break;
+      (void)host_chat_load_font(kFonts[i]);
+    }
+    if (!host_chat_font_loaded())
+      fprintf(stderr, "chat: no font at assets/fonts/LatoLatin-*.ttf; "
+                      "in-game chat lines are not drawn\n");
+  }
+  host_chat_tick(&src, active ? 1 : 0, MonotonicSeconds());
+  if (host_chat_active()) HostChatUpdateSeatNames();
+  if (HostGetenv("NET_TEST_NAMES")) {
+    /* Headless evidence: log each name tag appearing and disappearing. */
+    static int shown[HOST_CHAT_MAX_SEATS];
+    for (int i = 0; i < HOST_CHAT_MAX_SEATS; ++i) {
+      const int v = host_chat_tag_visible(i);
+      if (v != shown[i])
+        fprintf(stderr, "chat: name tag seat %d %s (%s)\n", i, v ? "shown" : "hidden",
+                host_chat_seat_name(i));
+      shown[i] = v;
+    }
+  }
+  if (!host_chat_active()) g_chat_hold_keyboard = false;
+  if (g_chat_text_input != (host_chat_typing() != 0))
+    HostChatSetTextInput(host_chat_typing() != 0);
+}
+
+/* True when the chat took the event (it never reaches HandleInput). */
+static bool HostChatHandleEvent(const SDL_Event *event) {
+  const double now = MonotonicSeconds();
+  if (!host_chat_active()) return false;
+  if (event->type == SDL_TEXTINPUT) {
+    if (!host_chat_typing()) return false;
+    if (now < g_chat_skip_open_char_until) {
+      g_chat_skip_open_char_until = -1.0;
+      if ((event->text.text[0] == 't' || event->text.text[0] == 'T') &&
+          event->text.text[1] == '\0')
+        return true; /* the T that opened the bar */
+    }
+    host_chat_text(event->text.text);
+    return true;
+  }
+  if (event->type != SDL_KEYDOWN) return false;
+  {
+    const SDL_Keycode key = SNESRECOMP_SDL_EVENT_KEY(*event);
+    const int mod = (int)SNESRECOMP_SDL_EVENT_MOD(*event);
+    if (!host_chat_typing()) {
+      if (key != SDLK_t || SNESRECOMP_SDL_EVENT_REPEAT(*event) ||
+          (mod & (KMOD_CTRL | KMOD_ALT | KMOD_GUI)) || snes_savestate_menu_is_open())
+        return false;
+      if (!host_chat_open(now)) return false;
+      g_chat_skip_open_char_until = now + 0.25;
+      HostChatSetTextInput(true);
+      return true;
+    }
+    g_chat_skip_open_char_until = -1.0;
+    (void)host_chat_key(key == SDLK_RETURN || key == SDLK_KP_ENTER ? HOST_CHAT_KEY_ENTER
+                        : key == SDLK_ESCAPE                        ? HOST_CHAT_KEY_ESCAPE
+                        : key == SDLK_BACKSPACE                     ? HOST_CHAT_KEY_BACKSPACE
+                                                                     : HOST_CHAT_KEY_OTHER,
+                        now);
+    if (!host_chat_typing()) {
+      HostChatSetTextInput(false);
+      g_chat_hold_keyboard = true; /* Enter must not reach the game as Start */
+    }
+    return true;
+  }
+}
+
+/* The keyboard half of the pad the session sends. */
+static uint32 HostChatFilterKeyboard(uint32 keys) {
+  if (host_chat_typing()) return 0;
+  if (g_chat_hold_keyboard) {
+    if (keys) return 0;
+    g_chat_hold_keyboard = false;
+  }
+  return keys;
+}
+
+#if !defined(__ANDROID__)
+static SDL_Texture *g_chat_sdl_texture[SNES_GL_OVERLAY_SLOTS];
+static int g_chat_sdl_w[SNES_GL_OVERLAY_SLOTS], g_chat_sdl_h[SNES_GL_OVERLAY_SLOTS];
+static uint32_t g_chat_sdl_generation[SNES_GL_OVERLAY_SLOTS];
+
+static void SdlRenderer_DrawChat(int output_w, int output_h, const SDL_Rect *frame) {
+  const SnesWindowOverlayQuad *quads = NULL;
+  const int rect[4] = { frame->x, frame->y, frame->w, frame->h };
+  const int n = HostChatOverlay(output_w, output_h, rect, g_sdl_renderer_rect.w,
+                                g_sdl_renderer_rect.h, &quads);
+  for (int i = 0; i < n; ++i) {
+    const SnesWindowOverlayQuad *q = &quads[i];
+    const int slot = q->slot;
+    if (!q->px || q->w <= 0 || q->h <= 0 || slot < 0 || slot >= SNES_GL_OVERLAY_SLOTS)
+      continue;
+    if (!g_chat_sdl_texture[slot] || q->w != g_chat_sdl_w[slot] || q->h != g_chat_sdl_h[slot]) {
+      if (g_chat_sdl_texture[slot]) SDL_DestroyTexture(g_chat_sdl_texture[slot]);
+      g_chat_sdl_texture[slot] = SDL_CreateTexture(g_renderer, SDL_PIXELFORMAT_ARGB8888,
+                                                   SDL_TEXTUREACCESS_STREAMING, q->w, q->h);
+      if (!g_chat_sdl_texture[slot]) continue;
+      SDL_SetTextureBlendMode(g_chat_sdl_texture[slot], SDL_BLENDMODE_BLEND);
+      g_chat_sdl_w[slot] = q->w;
+      g_chat_sdl_h[slot] = q->h;
+      g_chat_sdl_generation[slot] = q->generation - 1;
+    }
+    if (q->generation != g_chat_sdl_generation[slot]) {
+      SDL_UpdateTexture(g_chat_sdl_texture[slot], NULL, q->px, q->w * 4);
+      g_chat_sdl_generation[slot] = q->generation;
+    }
+    {
+      SDL_Rect dst = { q->x, q->y, q->w, q->h };
+      snesrecomp_sdl_render_texture(g_renderer, g_chat_sdl_texture[slot], NULL, &dst);
+    }
+  }
+}
+#endif
+#else
+static inline void HostChatFrame(void) {}
+static inline bool HostChatHandleEvent(const SDL_Event *event) { (void)event; return false; }
+static inline uint32 HostChatFilterKeyboard(uint32 keys) { return keys; }
+#endif
+
 static void SdlRenderer_Destroy(void) {
   SDL_DestroyTexture(g_texture);
   SDL_DestroyRenderer(g_renderer);
@@ -2293,6 +2543,13 @@ static void SdlRenderer_EndDraw(void) {
   /* SDL3's SDL_RenderTexture takes SDL_FRect, not SDL_Rect. */
   snesrecomp_sdl_render_texture(g_renderer, g_texture, &g_sdl_renderer_rect,
                                 &g_sdl_present_rect);
+#if defined(SNES_HAS_LOBBY_CLIENT) && defined(SNES_HOST_HAS_INGAME_CHAT) && !defined(__ANDROID__)
+  {
+    int output_w = 0, output_h = 0;
+    SdlRenderer_GetOutputSize(&output_w, &output_h);
+    SdlRenderer_DrawChat(output_w, output_h, &g_sdl_present_rect);
+  }
+#endif
   SDL_RenderPresent(g_renderer);
 }
 
@@ -2550,7 +2807,7 @@ static uint16_t netplay_capture_pad(void *ctx) {
   PollKeyboardControls(snesrecomp_sdl_get_keyboard_state());
   const unsigned player = snes_netplay_input_player() == 1 ? 1 : 0;
   return (uint16_t)snes_savestate_menu_filter_guest_input(
-      (((g_input_state | g_pad_buttons) >> (player * 12)) |
+      (((HostChatFilterKeyboard(g_input_state) | g_pad_buttons) >> (player * 12)) |
        g_gamepad[player].axis_buttons) & 0x0fffu);
 }
 
@@ -2563,6 +2820,7 @@ static void netplay_poll_events(void *ctx, int *want_soft_exit) {
   }
   while (SDL_PollEvent(&event)) {
     if (HandleDeviceEvent(&event)) continue;
+    if (HostChatHandleEvent(&event)) continue;
     if (event.type == SDL_QUIT) {
       *want_soft_exit = 2;
       g_netplay_from_lobby = 0; /* Closing the window exits the application. */
@@ -3206,6 +3464,9 @@ int snesrecomp_desktop_main(const SnesDesktopHostGame *game, int argc, char **ar
   g_snes_height = game->frame_height > 0 ? game->frame_height : 224;
 #ifndef __ANDROID__
   snesrecomp_opengl_set_viewport(game->compute_viewport);
+#if defined(SNES_HAS_LOBBY_CLIENT) && defined(SNES_HOST_HAS_INGAME_CHAT)
+  snesrecomp_opengl_set_window_overlay(HostChatOverlay);
+#endif
 #endif
   const char *build_version = game->build_version ? game->build_version : "dev";
 
@@ -3993,9 +4254,12 @@ error_reading:;
      * whole crash-capture pipeline (minidump + report + crash copy). */
     host_report_crash_test_tick();
 
+    HostChatFrame();
     double event_profile_start = ProfileStart();
     while (SDL_PollEvent(&event)) {
       if (HandleDeviceEvent(&event))
+        continue;
+      if (HostChatHandleEvent(&event))
         continue;
       switch (event.type) {
       case SDL_MOUSEWHEEL:

@@ -39,6 +39,7 @@
 #include "glsl_shader.h"
 #include "config.h"
 #include "display_aspect.h"
+#include "opengl.h"
 
 #define CODE(...) #__VA_ARGS__
 
@@ -67,6 +68,70 @@ static void (*g_compute_viewport)(int, int, int, int, SnesDisplayViewport *);
 void snesrecomp_opengl_set_viewport(void (*compute)(int, int, int, int,
                                                    SnesDisplayViewport *)) {
   g_compute_viewport = compute;
+}
+
+/* Window-space overlay (the in-game room chat): straight-alpha ARGB drawn
+ * at the drawable's own resolution after the frame and any GLSL shader, so
+ * text stays sharp instead of being scaled up with the 256-pixel field. */
+static SnesOpenGLWindowOverlayFn g_window_overlay;
+static unsigned int g_overlay_texture[SNES_GL_OVERLAY_SLOTS];
+static uint32_t g_overlay_generation[SNES_GL_OVERLAY_SLOTS];
+static int g_overlay_w[SNES_GL_OVERLAY_SLOTS], g_overlay_h[SNES_GL_OVERLAY_SLOTS];
+
+void snesrecomp_opengl_set_window_overlay(SnesOpenGLWindowOverlayFn fn) {
+  g_window_overlay = fn;
+}
+
+static void DrawWindowOverlay(int drawable_width, int drawable_height,
+                              const SnesDisplayViewport *viewport) {
+  const SnesWindowOverlayQuad *quads = NULL;
+  int frame_rect[4], count;
+  if (!g_window_overlay) return;
+  /* GL viewports count from the bottom; the overlay speaks top-left. */
+  frame_rect[0] = viewport->x;
+  frame_rect[1] = drawable_height - (viewport->y + viewport->height);
+  frame_rect[2] = viewport->width;
+  frame_rect[3] = viewport->height;
+  count = g_window_overlay(drawable_width, drawable_height, frame_rect,
+                           g_draw_width, g_draw_height, &quads);
+  if (count <= 0 || !quads) return;
+  glBindFramebuffer(GL_FRAMEBUFFER, 0);
+  glActiveTexture(GL_TEXTURE0);
+  glEnable(GL_BLEND);
+  glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ONE,
+                      GL_ONE_MINUS_SRC_ALPHA);
+  glUseProgram(g_program);
+  glUniform1i(glGetUniformLocation(g_program, "texture1"), 0);
+  glBindVertexArray(g_VAO);
+  for (int i = 0; i < count; ++i) {
+    const SnesWindowOverlayQuad *q = &quads[i];
+    const int slot = q->slot;
+    if (!q->px || q->w <= 0 || q->h <= 0 || slot < 0 || slot >= SNES_GL_OVERLAY_SLOTS)
+      continue;
+    if (!g_overlay_texture[slot]) {
+      glGenTextures(1, &g_overlay_texture[slot]);
+      g_overlay_generation[slot] = q->generation - 1;
+    }
+    glBindTexture(GL_TEXTURE_2D, g_overlay_texture[slot]);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    if (q->generation != g_overlay_generation[slot] || q->w != g_overlay_w[slot] ||
+        q->h != g_overlay_h[slot]) {
+      glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+      glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+      glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, q->w, q->h, 0, GL_BGRA,
+                   GL_UNSIGNED_INT_8_8_8_8_REV, q->px);
+      g_overlay_generation[slot] = q->generation;
+      g_overlay_w[slot] = q->w;
+      g_overlay_h[slot] = q->h;
+    }
+    glViewport(q->x, drawable_height - (q->y + q->h), q->w, q->h);
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+  }
+  glDisable(GL_BLEND);
+  glBindTexture(GL_TEXTURE_2D, g_texture.gl_texture);
 }
 
 /* interval: 0 immediate, 1 wait for the panel, -1 late-swap-tearing
@@ -419,6 +484,8 @@ static void OpenGLRenderer_EndDraw(void) {
     g_want_screenshot = false;
     SaveScreenshotBmp(drawable_width, drawable_height);
   }
+  /* After the screenshot: a capture shows the game, not the chat. */
+  DrawWindowOverlay(drawable_width, drawable_height, &viewport);
   if (g_screenshot_flash_start_time >= 0.0) {
     double now = MonotonicSeconds();
     glViewport(0, 0, drawable_width, drawable_height);

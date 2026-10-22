@@ -187,6 +187,11 @@ function(snesrecomp_enable_recomp_net target)
     if(DEFINED RECOMP_UI_ROOT AND EXISTS "${RECOMP_UI_ROOT}/src/recomp_launcher.h")
         target_include_directories(${target} PRIVATE "${RECOMP_UI_ROOT}/src")
         target_compile_definitions(${target} PRIVATE SNES_HOST_HAS_RECOMP_UI=1)
+        # The room chat inside the running game (src/desktop/host_chat.c): it
+        # rasterizes with the stb_truetype recomp-ui vendors with Dear ImGui.
+        target_sources(${target} PRIVATE
+            "${SNESRECOMP_RUNNER_ROOT}/src/desktop/host_chat.c")
+        target_compile_definitions(${target} PRIVATE SNES_HOST_HAS_INGAME_CHAT=1)
         if(NOT COMMAND recomp_target_launcher_netplay)
             message(FATAL_ERROR
                 "snesrecomp_enable_recomp_net(${target}): recomp-ui at "
