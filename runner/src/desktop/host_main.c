@@ -129,6 +129,11 @@ static const SnesDesktopHostGame *g_game;
 /* Stay true through transport shutdown, so disconnect cannot turn an online
  * match into an offline autosave or enable local state controls. */
 static bool g_netplay_session;
+/* The netplay host keeps the offline battery save: it reads saves/save.srm at
+ * boot (that SRAM is what every guest receives), and writes its progress back
+ * to the same file at exit. Guests and spectators run on a synced copy under
+ * saves/netplay and never touch their personal save. */
+static bool g_netplay_host_owns_sram;
 static char g_window_title[128];
 static char g_launcher_title[160];
 
@@ -4027,6 +4032,8 @@ error_reading:;
       return 1;
     }
     g_netplay_pending = 0;
+    g_netplay_host_owns_sram =
+        snes_netplay_is_host() && !snes_netplay_is_spectator();
   }
 #endif
 
@@ -4161,7 +4168,7 @@ error_reading:;
   PreparePpuFrame();
 
   MkDir("saves");
-  if (!g_netplay_session) RtlReadSram();
+  if (!g_netplay_session || g_netplay_host_owns_sram) RtlReadSram();
 
   OverlaySelftestPadAttach();
   OpenAllGamepads();
@@ -4813,7 +4820,7 @@ error_reading:;
   if (g_volume_changed || g_fullscreen_changed)
     WriteConfigFile(g_active_config_file);
 
-  if (!g_netplay_session) RtlWriteSram();
+  if (!g_netplay_session || g_netplay_host_owns_sram) RtlWriteSram();
 #if defined(SNES_HAS_LOBBY_CLIENT)
   /* Reopen the launcher from a clean process. No match state is resumed and
    * offline mod selections are already the durable on-disk plan. */
