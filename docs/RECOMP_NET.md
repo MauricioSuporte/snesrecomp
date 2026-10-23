@@ -236,6 +236,30 @@ showing a frozen frame forever. Backlogs of 16/48/96 frames are logged as
 `RNET_TEST_INPUT_LOSS_PCT=<0..90>` drops that share of outgoing INPUT
 datagrams for loopback tests.
 
+### Host authority: guest input lag
+
+A host-authority guest's runway is no longer the room's input delay D (a
+lockstep figure: the host does not schedule guest input D ticks ahead). It
+used to be: after the first starvation the latch waited for D queued host
+rows and the catch-up kept them, so the guest ran D frames behind rows it
+already had, on top of its round trip. The guest now keeps an adaptive jitter
+buffer (`snes_host_auth_buffer_rows`: 1 row to start, +1 when it starves twice
+within 3 s up to 4, -1 after 10 s without starving down to 0;
+`SNES_NET_AUTH_BUFFER=<n>` pins it), and the catch-up drains everything above
+it. Lockstep peers and observers keep D. While a guest waits for the host's
+row the desktop loop sleeps in 2 ms slices, pumps SDL events, refreshes the
+pad (`snes_netplay_refresh_local` -> recomp-net
+`rnet_session_auth_refresh_local`, which sends a changed pad up to two ticks
+ahead) and runs the frame as soon as the row is here and half a period has
+passed, re-phasing its clock onto the host's rows. recomp-net's host takes a
+guest's inputs in order, one change per tick (identical runs collapse; past
+three pending changes it jumps to the newest), instead of only the newest, which
+lost taps that arrived with a newer input. The host still never waits.
+Diagnostics: `auth_buffer` (guest; -1 elsewhere), `presend` (guest) and
+`input_jumps` (host) in `net_diag_*.jsonl`; `host_authority guest buffer=` log
+lines. Tests: recomp-net `session_host_authority_input_test`, snesrecomp
+`tests/netplay/auth_guest_buffer_test.c`.
+
 Input bundles must cover the full delay prefix on start (`delay+1` wire
 ticks including tick 0). `RNET_MAX_BUNDLE` is 21 (max delay 20 + 1);
 `send_input_bundle` also splits across multiple INPUT packets if the

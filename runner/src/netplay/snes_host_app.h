@@ -70,6 +70,12 @@ int snes_host_barrier_admit(int from_lobby, int *running,
  * burst after delay_sync_starvation clears; capped at 16).
  */
 int snes_host_catchup_budget(void);
+/* Host-authority guest: rows kept queued against network jitter (adaptive,
+ * 1 by default; SNES_NET_AUTH_BUFFER pins it), and whether the host's next
+ * row is here with that buffer intact, so the frame may run now instead of
+ * waiting for the guest's own clock. 0 when not a host-authority guest. */
+int snes_host_auth_buffer_rows(void);
+int snes_host_auth_row_ready(void);
 
 /* Shared connect-timeout copy for on_connect_timeout modals. */
 const char *snes_host_connect_timeout_error_code(int is_ice);

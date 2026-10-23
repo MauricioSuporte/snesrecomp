@@ -159,6 +159,13 @@ int  snes_netplay_connect_timed_out(uint32_t timeout_ms);
 
 /* Stage local pad bits (12 SNES buttons) for the current sim tick. */
 void snes_netplay_stage_local(uint16_t buttons);
+/* Host-authority guest: refresh the local pad while waiting for the host's
+ * next row. A changed pad is sent at once (recomp-net
+ * rnet_session_auth_refresh_local) instead of on the next admitted tick. Never
+ * changes this peer's simulation; no-op everywhere else. */
+void snes_netplay_refresh_local(uint16_t buttons);
+/* Monotonic milliseconds (the netplay diagnostics clock). */
+uint64_t snes_netplay_clock_ms(void);
 
 int  snes_netplay_needs_local_sample(void);
 int  snes_netplay_input_desync(uint32_t *tick, uint32_t *local_hash, uint32_t *remote_hash);

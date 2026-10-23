@@ -53,6 +53,8 @@ static inline const char *snes_netplay_rb_stall_tag(void) { return "none"; }
 #include "snes_lobby_client.h"
 #endif
 #include "desktop/sdl_compat.h"
+/* snes_host_app.c: the host-authority guest's jitter buffer (diagnostics). */
+int snes_host_auth_buffer_rows(void);
 #endif
 
 void snes_netplay_config_defaults(SnesNetplayConfig *cfg)
@@ -167,6 +169,8 @@ int  snes_netplay_connect_timed_out(uint32_t timeout_ms)
     return 0;
 }
 void snes_netplay_stage_local(uint16_t buttons) { (void)buttons; }
+void snes_netplay_refresh_local(uint16_t buttons) { (void)buttons; }
+uint64_t snes_netplay_clock_ms(void) { return (uint64_t)SDL_GetTicks(); }
 int  snes_netplay_needs_local_sample(void) { return 0; }
 int  snes_netplay_input_desync(uint32_t *tick, uint32_t *local_hash, uint32_t *remote_hash)
 {
@@ -763,6 +767,23 @@ uint32_t snes_netplay_sim_tick(void)
 uint32_t snes_netplay_frames_finished(void)
 {
     return snes_netplay_active() ? g_np.frames_finished : 0;
+}
+
+uint64_t snes_netplay_clock_ms(void)
+{
+    return np_diagnostic_clock_ms();
+}
+
+void snes_netplay_refresh_local(uint16_t buttons)
+{
+    if (!snes_netplay_host_authority_guest() || g_np.spectator || g_np.menu ||
+        !rnet_session_is_running(g_np.session))
+        return;
+    /* The tick latch in stage_local keeps a tick's own sample stable; a
+     * refreshed sample becomes the NEXT tick's input, so it may differ. */
+    g_np.staged_buttons = buttons & 0x0FFFu;
+    g_np.staged_valid = 1;
+    (void)rnet_session_auth_refresh_local(g_np.session);
 }
 
 void snes_netplay_stage_local(uint16_t buttons)
@@ -2836,6 +2857,7 @@ void snes_netplay_diag_tick(void)
                 "\"pkts_rx\":%u,\"input_sends\":%u,"
                 "\"is_host\":%d,\"host_authority\":%d,\"backlog\":%d,"
                 "\"resend_rows\":%u,\"rows_dropped\":%u,"
+                "\"auth_buffer\":%d,\"input_jumps\":%u,\"presend\":%u,"
                 "\"frames\":%u,\"catchup\":%u,\"catchup_total\":%u,"
                 "\"presents\":%u,\"frame_ms_avg\":%.2f,\"frame_ms_max\":%.2f,"
                 "\"pump_gap_max_ms\":%llu,\"pump_dur_max_ms\":%llu}\n",
@@ -2854,6 +2876,8 @@ void snes_netplay_diag_tick(void)
                 (unsigned)st.input_bundle_sends,
                 g_np.is_host, st.host_authority, st.auth_backlog,
                 (unsigned)st.auth_resend_rows, (unsigned)st.auth_rows_dropped,
+                snes_netplay_host_authority_guest() ? snes_host_auth_buffer_rows() : -1,
+                (unsigned)st.auth_input_jumps, (unsigned)st.auth_presend,
                 (unsigned)g_np.diag_frames, (unsigned)g_np.diag_catchup_frames,
                 (unsigned)g_np.catchup_frames_total, (unsigned)g_np.diag_presents,
                 g_np.diag_frames ? g_np.diag_frame_ms_sum / g_np.diag_frames : 0.0,

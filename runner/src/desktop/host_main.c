@@ -4381,8 +4381,34 @@ error_reading:;
       }
       if (!snes_host_clock_simulation_due(&video_clock, MonotonicSeconds())) {
         snes_netplay_pump();
-        WaitUntil(video_clock.next_simulation);
-        continue;
+        if (!snes_netplay_host_authority_guest()) {
+          WaitUntil(video_clock.next_simulation);
+          continue;
+        }
+        /* Host-authority guest: its frame is bound to the host's row, not to
+         * its own clock. Sleeping to the deadline in one go held a row that
+         * arrived early for up to a frame, and a button pressed meanwhile
+         * left on the next tick. Wait in short slices instead: keep events
+         * and the pad fresh, send a changed pad at once, and run as soon as
+         * the row is here and at least half a period has passed (the clock
+         * then re-phases onto the host's rows). The host's 60 Hz still paces
+         * the guest; it cannot run ahead of rows it does not have. */
+        {
+          int want_exit = 0;
+          double now = MonotonicSeconds();
+          netplay_poll_events(NULL, &want_exit);
+          if (want_exit) g_netplay_exit_requested = want_exit;
+          snes_netplay_refresh_local(netplay_capture_pad(NULL));
+          if (snes_host_auth_row_ready() &&
+              now >= video_clock.next_simulation - 0.5 / video_clock.simulation_hz) {
+            video_clock.next_simulation = now;
+          } else {
+            double slice = now + 0.002;
+            WaitUntil(video_clock.next_simulation < slice
+                          ? video_clock.next_simulation : slice);
+            continue;
+          }
+        }
       }
       SnesHostBarrierHooks hooks;
       int run = running;

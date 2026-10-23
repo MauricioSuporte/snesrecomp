@@ -38,6 +38,8 @@ int snes_netplay_input_desync(uint32_t *t, uint32_t *l, uint32_t *r)
 { (void)t; (void)l; (void)r; return 0; }
 void snes_netplay_stage_local(uint16_t buttons) { (void)buttons; }
 void snes_netplay_pump(void) {}
+int snes_netplay_host_authority_guest(void) { return 0; }
+uint64_t snes_netplay_clock_ms(void) { return 0; }
 static uint16_t capture(void *ctx) { (void)ctx; return 0; }
 
 static void reason_cases(void)

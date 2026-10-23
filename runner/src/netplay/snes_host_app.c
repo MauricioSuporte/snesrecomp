@@ -139,6 +139,15 @@ static struct {
   int just_cleared;
 } g_starv;
 
+/* Host-authority guest jitter buffer state (see starv_runway). */
+static struct {
+  int inited;
+  int target;
+  int pinned;
+  uint32_t last_starve_ms;
+  uint32_t calm_since_ms;
+} g_auth_buf;
+
 static int starv_env_int(const char *name, int def)
 {
   const char *v = getenv(name);
@@ -156,12 +165,112 @@ static int starv_env_int(const char *name, int def)
 static void starv_reset(void)
 {
   memset(&g_starv, 0, sizeof(g_starv));
+  g_auth_buf.inited = 0; /* next match starts from the default buffer */
+}
+
+/*
+ * Host-authority guest jitter buffer.
+ *
+ * Under host authority the room's input delay D is lockstep's figure: the
+ * host does not schedule guest input D ticks ahead, it folds in whatever has
+ * arrived. The runway below used to be D for every peer, so after the first
+ * hiccup a guest's starvation latch rebuilt D queued host rows and the
+ * catch-up kept them: the guest ran D frames behind rows it already had,
+ * on top of its round trip. A guest only needs enough rows to ride out
+ * network jitter. It starts at one row, grows by one (to
+ * SNES_AUTH_BUFFER_MAX) when it starves twice within
+ * SNES_AUTH_BUFFER_GROW_MS, and gives one back after SNES_AUTH_BUFFER_CALM_MS
+ * without starving; the catch-up drains the surplus. SNES_NET_AUTH_BUFFER
+ * pins it. The host never waits either way, so this only moves the guest.
+ */
+#define SNES_AUTH_BUFFER_START 1
+#define SNES_AUTH_BUFFER_MAX 4
+#define SNES_AUTH_BUFFER_GROW_MS 3000u
+#define SNES_AUTH_BUFFER_CALM_MS 10000u
+
+
+static void auth_buf_init(void)
+{
+  const char *v;
+  uint32_t now;
+  if (g_auth_buf.inited)
+    return;
+  memset(&g_auth_buf, 0, sizeof(g_auth_buf));
+  g_auth_buf.inited = 1;
+  g_auth_buf.target = SNES_AUTH_BUFFER_START;
+  v = getenv("SNES_NET_AUTH_BUFFER");
+  if (v && v[0]) {
+    char *end;
+    long n = strtol(v, &end, 10);
+    if (end != v && *end == '\0' && n >= 0 && n <= 16) {
+      g_auth_buf.target = (int)n;
+      g_auth_buf.pinned = 1;
+    }
+  }
+  now = (uint32_t)snes_netplay_clock_ms();
+  g_auth_buf.calm_since_ms = now;
+}
+
+static void auth_buf_log(const char *why)
+{
+  fprintf(stderr,
+          "snes_netplay: host_authority guest buffer=%d rows (%s) sim=%u lead=%d\n",
+          g_auth_buf.target, why, (unsigned)snes_netplay_sim_tick(),
+          snes_netplay_remote_lead());
+}
+
+/* A guest starvation (latch) event: grow when it repeats soon. */
+static void auth_buf_note_starve(void)
+{
+  uint32_t now;
+  auth_buf_init();
+  now = (uint32_t)snes_netplay_clock_ms();
+  if (!g_auth_buf.pinned && g_auth_buf.last_starve_ms &&
+      now - g_auth_buf.last_starve_ms < SNES_AUTH_BUFFER_GROW_MS &&
+      g_auth_buf.target < SNES_AUTH_BUFFER_MAX) {
+    g_auth_buf.target++;
+    auth_buf_log("grew: repeated starvation");
+  }
+  g_auth_buf.last_starve_ms = now;
+  g_auth_buf.calm_since_ms = now;
+}
+
+int snes_host_auth_buffer_rows(void)
+{
+  uint32_t now;
+  auth_buf_init();
+  now = (uint32_t)snes_netplay_clock_ms();
+  if (!g_auth_buf.pinned && g_auth_buf.target > 0 &&
+      now - g_auth_buf.calm_since_ms >= SNES_AUTH_BUFFER_CALM_MS) {
+    g_auth_buf.target--;
+    g_auth_buf.calm_since_ms = now;
+    auth_buf_log("shrank: steady connection");
+  }
+  return g_auth_buf.target;
+}
+
+/* Rows this peer keeps queued: the jitter buffer for a host-authority
+ * guest, the input delay D for everything else (lockstep, observers). */
+static int starv_runway(void)
+{
+  int delay;
+  if (snes_netplay_host_authority_guest())
+    return snes_host_auth_buffer_rows();
+  delay = snes_netplay_input_delay();
+  return delay < 0 ? 0 : delay;
+}
+
+int snes_host_auth_row_ready(void)
+{
+  if (!snes_netplay_host_authority_guest())
+    return 0;
+  return snes_netplay_remote_lead() >= snes_host_auth_buffer_rows();
 }
 
 static int starv_runway_ok(void)
 {
   int lead = snes_netplay_remote_lead();
-  int delay = snes_netplay_input_delay();
+  int delay = starv_runway();
   int hr_lead = starv_env_int("SNES_NET_STARVATION_EXIT_HR_LEAD",
                               SNES_STARVATION_EXIT_HR_LEAD_DEFAULT);
 
@@ -238,15 +347,15 @@ static int barrier_poll_admit(int enter_need)
       if (burst > 0) {
         fprintf(stderr,
                 "snes_netplay: delay_sync_starvation cleared sim=%u lead=%d "
-                "D=%d — recovery burst %d\n",
+                "runway=%d — recovery burst %d\n",
                 (unsigned)snes_netplay_sim_tick(), snes_netplay_remote_lead(),
-                snes_netplay_input_delay(), burst);
+                starv_runway(), burst);
       } else {
         fprintf(stderr,
                 "snes_netplay: delay_sync_starvation cleared sim=%u lead=%d "
-                "D=%d — resume 1:1 (rebuild input buffer)\n",
+                "runway=%d — resume 1:1 (rebuild input buffer)\n",
                 (unsigned)snes_netplay_sim_tick(), snes_netplay_remote_lead(),
-                snes_netplay_input_delay());
+                starv_runway());
       }
     }
     return 1;
@@ -264,12 +373,14 @@ static int barrier_poll_admit(int enter_need)
   if (g_starv.enter_run >= enter_need) {
     g_starv.latched = 1;
     g_starv.enter_run = 0;
+    if (snes_netplay_host_authority_guest())
+      auth_buf_note_starve();
     if (!g_starv.latch_logged) {
       fprintf(stderr,
-              "snes_netplay: delay_sync_starvation latched sim=%u lead=%d D=%d "
+              "snes_netplay: delay_sync_starvation latched sim=%u lead=%d runway=%d "
               "(enter=%d)\n",
               (unsigned)snes_netplay_sim_tick(), snes_netplay_remote_lead(),
-              snes_netplay_input_delay(), enter_need);
+              starv_runway(), enter_need);
       g_starv.latch_logged = 1;
     }
   }
@@ -497,10 +608,9 @@ int snes_host_catchup_budget(void)
   if (cap <= 0 && g_starv.recovery_amount <= 0)
     return 0;
   lead = snes_netplay_remote_lead();
-  delay = snes_netplay_input_delay();
-  if (delay < 0)
-    delay = 0;
-  /* Only spend surplus above D; keep the delay runway intact. */
+  delay = starv_runway();
+  /* Only spend surplus above the runway (D, or a host-authority guest's
+   * jitter buffer); keep the runway intact. */
   extra = lead - delay;
   if (extra < 0)
     extra = 0;
