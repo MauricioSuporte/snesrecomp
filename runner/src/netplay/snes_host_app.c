@@ -128,6 +128,16 @@ static void barrier_soft_exit(int from_lobby, int *running, const char *origin,
  * window drag) became permanent lag that only grew, until the guest trailed
  * the host by more than its history and froze for good. */
 #define SNES_AUTH_CATCHUP_CAP_DEFAULT 3
+/* A guest whose PC cannot hold 60 fps falls behind a little every second and
+ * the 3-frame catch-up, each frame rendered in full, never closed the gap
+ * (2026-10-23: a guest drifted ~3 frames/s behind until it was 100+ frames
+ * late and the host's window refused its inputs). Catch-up frames are now
+ * simulated without composing their picture (ppu_setSkipLineDraw, host
+ * loop), and once the guest is this far behind the cap opens wider so a slow
+ * PC still converges. SNES_NET_CATCHUP_CAP / SNES_NET_CATCHUP_CAP_FAR pin
+ * them. */
+#define SNES_AUTH_CATCHUP_FAR_ROWS 12
+#define SNES_AUTH_CATCHUP_CAP_FAR_DEFAULT 8
 
 static struct {
   int latched;
@@ -456,6 +466,7 @@ int snes_host_barrier_admit(int from_lobby, int *running,
               snes_netplay_transport_name(), (unsigned)connect_ms);
       wait_logged = 1;
     }
+    snes_netplay_wait_report();
     if (snes_netplay_ice_failed() && !ice_fail_logged) {
       fprintf(stderr,
               "snes_netplay: ICE FAILED while waiting for peer — "
@@ -587,13 +598,14 @@ int snes_host_barrier_admit(int from_lobby, int *running,
   return 0; /* input starvation / confirm stall — present held, retry next wall tick */
 }
 
-int snes_host_catchup_budget(void)
+/* Catch-up frames allowed in this burst with `lead` rows queued. */
+static int catchup_budget_at(int lead)
 {
-  int lead;
   int delay;
   int extra;
   int budget;
   int cap;
+  int guest;
 
   if (!snes_netplay_active())
     return 0;
@@ -601,14 +613,19 @@ int snes_host_catchup_budget(void)
    * and a burst here would race it. */
   if (snes_netplay_rollback_active())
     return 0;
+  guest = snes_netplay_host_authority_guest();
   cap = starv_env_int("SNES_NET_CATCHUP_CAP",
-                      snes_netplay_host_authority_guest()
-                          ? SNES_AUTH_CATCHUP_CAP_DEFAULT
-                          : SNES_CATCHUP_CAP_DEFAULT);
+                      guest ? SNES_AUTH_CATCHUP_CAP_DEFAULT
+                            : SNES_CATCHUP_CAP_DEFAULT);
   if (cap <= 0 && g_starv.recovery_amount <= 0)
     return 0;
-  lead = snes_netplay_remote_lead();
   delay = starv_runway();
+  if (guest && cap > 0 && lead - delay >= SNES_AUTH_CATCHUP_FAR_ROWS) {
+    int far = starv_env_int("SNES_NET_CATCHUP_CAP_FAR",
+                            SNES_AUTH_CATCHUP_CAP_FAR_DEFAULT);
+    if (far > cap)
+      cap = far;
+  }
   /* Only spend surplus above the runway (D, or a host-authority guest's
    * jitter buffer); keep the runway intact. */
   extra = lead - delay;
@@ -620,4 +637,28 @@ int snes_host_catchup_budget(void)
   if (budget > cap)
     budget = cap;
   return budget;
+}
+
+int snes_host_catchup_budget(void)
+{
+  return catchup_budget_at(snes_netplay_remote_lead());
+}
+
+/* Before running burst frame `burst` (0 = the frame the barrier admitted):
+ * will another catch-up frame follow it? It consumes one queued row, so the
+ * loop's check after it sees one row less. Only a host-authority guest skips
+ * pictures; a frame followed by another is never presented, so its pixels
+ * need not be composed. A wrong guess costs nothing worse than one frame
+ * composed for nothing, or one stale picture. */
+int snes_host_catchup_skip_draw(int burst)
+{
+  int lead;
+  if (!snes_netplay_host_authority_guest())
+    return 0;
+  if (starv_env_int("SNES_NET_CATCHUP_DRAW_ALL", 0))
+    return 0;
+  lead = snes_netplay_remote_lead() - 1;
+  if (lead < 1)
+    return 0;
+  return burst < catchup_budget_at(lead);
 }

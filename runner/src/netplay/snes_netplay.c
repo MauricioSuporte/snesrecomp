@@ -154,6 +154,8 @@ uint32_t snes_netplay_sim_tick(void) { return 0; }
 uint32_t snes_netplay_frames_finished(void) { return 0; }
 void snes_netplay_note_frame(double frame_ms, int catchup) { (void)frame_ms; (void)catchup; }
 void snes_netplay_note_present(void) {}
+void snes_netplay_note_draw_skip(void) {}
+void snes_netplay_wait_report(void) {}
 int  snes_netplay_host_authority_guest(void) { return 0; }
 int  snes_netplay_auth_guest_lost(void) { return 0; }
 int  snes_netplay_start(const SnesNetplayConfig *cfg)
@@ -313,6 +315,12 @@ typedef struct {
     double       diag_frame_ms_sum;
     double       diag_frame_ms_max;
     uint32_t     catchup_frames_total;
+    uint32_t     diag_draw_skips;
+    uint32_t     draw_skips_total;
+    /* Start rendezvous report (snes_netplay_wait_report). */
+    uint64_t     wait_started_ms;
+    uint64_t     wait_report_ms;
+    uint32_t     wait_last_mask;
     /* Backlog warnings (stderr, rate-limited) and the lost-guest exit. */
     uint64_t     backlog_warn_ms;
     int          backlog_warn_level;
@@ -1231,6 +1239,9 @@ int snes_netplay_start(const SnesNetplayConfig *cfg)
     g_np.diag_frames = g_np.diag_catchup_frames = g_np.diag_presents = 0;
     g_np.diag_frame_ms_sum = g_np.diag_frame_ms_max = 0;
     g_np.catchup_frames_total = 0;
+    g_np.diag_draw_skips = g_np.draw_skips_total = 0;
+    g_np.wait_started_ms = g_np.wait_report_ms = 0;
+    g_np.wait_last_mask = 0;
     g_np.backlog_warn_ms = 0;
     g_np.backlog_warn_level = 0;
     g_np.auth_lost_since_ms = 0;
@@ -2687,6 +2698,102 @@ void snes_netplay_note_present(void)
         g_np.diag_presents++;
 }
 
+void snes_netplay_note_draw_skip(void)
+{
+    if (!snes_netplay_active())
+        return;
+    g_np.diag_draw_skips++;
+    g_np.draw_skips_total++;
+}
+
+/* Before RUNNING the screen is black and nothing said why: the host waits for
+ * READY from every occupied seat (recomp-net maybe_bootstrap), a guest waits
+ * for the host's START. Say, every few seconds, who is missing and whether
+ * anything at all has arrived from them -- a seat that is silent never
+ * started its match (still in a dialog, downloading mods, closed) or its path
+ * died; a seat that is heard but not ready is still linking. */
+void snes_netplay_wait_report(void)
+{
+    RNetSessionStats st;
+    uint64_t now;
+    char line[256];
+    char osd[160];
+    size_t n = 0, o = 0;
+    int slot, missing = 0, first_missing = -1, first_silent = 1;
+    uint32_t mask;
+
+    if (!snes_netplay_active() || !g_np.session || g_np.spectator)
+        return;
+    if (rnet_session_is_running(g_np.session)) {
+        if (g_np.wait_started_ms && g_np.wait_report_ms)
+            fprintf(stderr, "snes_netplay: every seat ready after %llu ms -- starting\n",
+                    (unsigned long long)(np_diagnostic_clock_ms() - g_np.wait_started_ms));
+        g_np.wait_started_ms = g_np.wait_report_ms = 0;
+        return;
+    }
+    now = np_diagnostic_clock_ms();
+    if (!g_np.wait_started_ms) {
+        g_np.wait_started_ms = now;
+        g_np.wait_report_ms = 0;
+        g_np.wait_last_mask = 0;
+        return;
+    }
+    memset(&st, 0, sizeof(st));
+    rnet_session_get_stats(g_np.session, &st);
+    mask = st.ready_mask;
+    /* First word after 3 s, then every 5 s, and at once when a seat joins. */
+    if (now - g_np.wait_started_ms < 3000u)
+        return;
+    if (g_np.wait_report_ms && now - g_np.wait_report_ms < 5000u &&
+        mask == g_np.wait_last_mask)
+        return;
+    g_np.wait_report_ms = now;
+    g_np.wait_last_mask = mask;
+
+    if (g_np.is_host) {
+        for (slot = 1; slot < g_np.slot_count && slot < RNET_MAX_SLOTS; ++slot) {
+            const char *what;
+            int silent = st.peer_rx_age_ms[slot] == RNET_PEER_RX_NEVER;
+            if (mask & (1u << slot))
+                what = "ready";
+            else if (st.peer_gone_mask & (1u << slot))
+                what = "left";
+            else
+                what = silent ? "silent (nothing received)" : "heard, not ready";
+            if (!(mask & (1u << slot))) {
+                missing++;
+                if (first_missing < 0) {
+                    first_missing = slot;
+                    first_silent = silent;
+                }
+            }
+            if (n < sizeof(line))
+                n += (size_t)snprintf(line + n, sizeof(line) - n, " P%d=%s", slot + 1, what);
+        }
+        fprintf(stderr,
+                "snes_netplay: waiting %llu ms for seats:%s ready_mask=0x%x pkts_rx=%u\n",
+                (unsigned long long)(now - g_np.wait_started_ms), line,
+                (unsigned)mask, (unsigned)st.packets_rx);
+        if (missing > 0) {
+            o = (size_t)snprintf(osd, sizeof(osd), "Waiting for P%d%s", first_missing + 1,
+                                 first_silent ? " (no answer yet)" : " (connecting)");
+            if (missing > 1 && o < sizeof(osd))
+                snprintf(osd + o, sizeof(osd) - o, " +%d more", missing - 1);
+            snes_osd_push(osd, 5500);
+        }
+    } else {
+        int heard = st.peer_rx_age_ms[0] != RNET_PEER_RX_NEVER;
+        fprintf(stderr,
+                "snes_netplay: waiting %llu ms for the host to start (host %s) pkts_rx=%u\n",
+                (unsigned long long)(now - g_np.wait_started_ms),
+                heard ? "heard; it is waiting for the other players"
+                      : "silent: nothing received from it",
+                (unsigned)st.packets_rx);
+        snes_osd_push(heard ? "Waiting for the other players to load"
+                            : "Waiting for the host (no answer yet)", 5500);
+    }
+}
+
 int snes_netplay_host_authority_guest(void)
 {
     return snes_netplay_active() && g_np.host_authority && !g_np.is_host &&
@@ -2713,11 +2820,12 @@ static void np_auth_watch(void)
         fprintf(stderr,
                 "snes_netplay: host_authority backlog=%d frames role=%s sim=%u "
                 "remote_lead=%d resend_rows=%u rows_dropped=%u catchup_total=%u "
-                "monotonic_ms=%llu\n",
+                "draw_skips=%u monotonic_ms=%llu\n",
                 st.auth_backlog, g_np.is_host ? "host(slowest guest)" : "guest",
                 (unsigned)st.sim_tick, st.remote_lead,
                 (unsigned)st.auth_resend_rows, (unsigned)st.auth_rows_dropped,
                 (unsigned)g_np.catchup_frames_total,
+                (unsigned)g_np.draw_skips_total,
                 (unsigned long long)now);
         g_np.backlog_warn_ms = now;
     } else if (level == 0 && g_np.backlog_warn_level > 0) {
@@ -2859,6 +2967,7 @@ void snes_netplay_diag_tick(void)
                 "\"resend_rows\":%u,\"rows_dropped\":%u,"
                 "\"auth_buffer\":%d,\"input_jumps\":%u,\"presend\":%u,"
                 "\"frames\":%u,\"catchup\":%u,\"catchup_total\":%u,"
+                "\"draw_skips\":%u,\"draw_skips_total\":%u,\"ready_mask\":%u,"
                 "\"presents\":%u,\"frame_ms_avg\":%.2f,\"frame_ms_max\":%.2f,"
                 "\"pump_gap_max_ms\":%llu,\"pump_dur_max_ms\":%llu}\n",
                 (unsigned)now, g_np.local_slot, transport ? transport : "none",
@@ -2879,12 +2988,15 @@ void snes_netplay_diag_tick(void)
                 snes_netplay_host_authority_guest() ? snes_host_auth_buffer_rows() : -1,
                 (unsigned)st.auth_input_jumps, (unsigned)st.auth_presend,
                 (unsigned)g_np.diag_frames, (unsigned)g_np.diag_catchup_frames,
-                (unsigned)g_np.catchup_frames_total, (unsigned)g_np.diag_presents,
+                (unsigned)g_np.catchup_frames_total,
+                (unsigned)g_np.diag_draw_skips, (unsigned)g_np.draw_skips_total,
+                (unsigned)st.ready_mask, (unsigned)g_np.diag_presents,
                 g_np.diag_frames ? g_np.diag_frame_ms_sum / g_np.diag_frames : 0.0,
                 g_np.diag_frame_ms_max,
                 (unsigned long long)g_np.timing.max_gap_ms,
                 (unsigned long long)g_np.timing.max_duration_ms);
         g_np.diag_frames = g_np.diag_catchup_frames = g_np.diag_presents = 0;
+        g_np.diag_draw_skips = 0;
         g_np.diag_frame_ms_sum = g_np.diag_frame_ms_max = 0;
     }
 }

@@ -2804,6 +2804,30 @@ static int netplay_test_input(uint16_t *out) {
   return 1;
 }
 
+/* Frame skip notice. A guest that keeps skipping pictures to stay with the
+ * host is on a PC below 60 fps (or one busy with something else): say so on
+ * screen, at most every 30 s, and log the share of frames skipped, so the
+ * player knows why the picture is choppy and the report names the cause. */
+static void NetplayNoteFrameSkip(void) {
+  static uint32_t window_start, window_skips, last_notice;
+  uint32_t now = SDL_GetTicks();
+  if (!window_start || now - window_start >= 5000u) {
+    if (window_start && window_skips >= 60u) {
+      fprintf(stderr,
+              "snes_netplay: frame_skip %u pictures skipped in %u ms to keep "
+              "up with the host (this PC is not holding 60 fps)\n",
+              (unsigned)window_skips, (unsigned)(now - window_start));
+      if (!last_notice || now - last_notice >= 30000u) {
+        snes_osd_push("Slow PC: skipping frames to keep up with the host", 4000);
+        last_notice = now;
+      }
+    }
+    window_start = now ? now : 1u;
+    window_skips = 0;
+  }
+  window_skips++;
+}
+
 static uint16_t netplay_capture_pad(void *ctx) {
   uint16_t test_pad;
   (void)ctx;
@@ -4432,9 +4456,24 @@ error_reading:;
       }
       if (admitted) {
         int burst = 0;
+        const double burst_t0 = MonotonicSeconds();
+        /* Never let one burst hold the loop for more than two frame
+         * periods: events, the pad and audio stay serviced. */
+        const double burst_limit = 2.0 / g_simulation_hz;
+        double frame_cost = 0;
         for (;;) {
           uint32 inputs = snes_netplay_published_inputs() | snes_netplay_active_mask();
           double net_frame_t0 = MonotonicSeconds();
+          /* Frame skip: a catch-up frame that another one follows is never
+           * shown, so it runs without composing its picture (sprite
+           * evaluation, HDMA and the raster IRQ still run: those are
+           * machine state). This is what lets a guest whose PC is below
+           * 60 fps keep pace with the host instead of drifting behind. */
+          const bool last_by_time =
+              net_frame_t0 - burst_t0 + frame_cost > burst_limit;
+          const bool skip_draw =
+              !last_by_time && snes_host_catchup_skip_draw(burst) != 0;
+          ppu_setSkipLineDraw(skip_draw);
           g_profile_frame = frameCtr + 1;
           double profile_start = ProfileStart();
           if (game->before_run_frame) game->before_run_frame();
@@ -4455,15 +4494,23 @@ error_reading:;
           profile_start = ProfileStart();
           CaptureSimulationFrame(frameCtr);
           NoteStateFrame();
+          ppu_setSkipLineDraw(false);
           ProfileEnd(kProfileRaster, profile_start);
           snes_netplay_finish_frame();
-          snes_netplay_note_frame((MonotonicSeconds() - net_frame_t0) * 1000.0, burst > 0);
+          frame_cost = MonotonicSeconds() - net_frame_t0;
+          snes_netplay_note_frame(frame_cost * 1000.0, burst > 0);
+          if (skip_draw) {
+            snes_netplay_note_draw_skip();
+            NetplayNoteFrameSkip();
+          }
           if (run_frames && frameCtr >= run_frames) {
             running = false;
             exit_reason = "RUN_FRAMES reached";
             break;
           }
           if (burst >= snes_host_catchup_budget())
+            break;
+          if (last_by_time)
             break;
           snes_netplay_stage_local(netplay_capture_pad(NULL));
           if (!snes_netplay_poll_admit())

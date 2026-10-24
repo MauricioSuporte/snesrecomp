@@ -703,6 +703,10 @@ static inline uint8 PpuMosaicAt(Ppu *ppu, int i) {
 /* Frame of the last OAM ring snapshot; see the note in ppu_runLine. Debug
  * instrumentation only -- it never affects rendering. */
 static int s_oam_snap_frame = -1;
+static bool s_skip_line_draw;
+
+void ppu_setSkipLineDraw(bool skip) { s_skip_line_draw = skip; }
+bool ppu_skipLineDraw(void) { return s_skip_line_draw; }
 
 /* PPU register write journal -- see ppu.h. */
 #define PPU_WLOG_CAP (1u << 17)
@@ -837,6 +841,11 @@ void ppu_runLine(Ppu* ppu, int line) {
       memset(&ppu->overlayBuffers[kPpuOverlaySource_Obj], 0,
              sizeof(ppu->overlayBuffers[kPpuOverlaySource_Obj]));
     ppu->lineHasSprites = !PPU_forcedBlank(ppu) && ppu_evaluateSprites(ppu, line - 1);
+
+    /* A frame nobody will see (netplay catch-up): the sprite evaluation
+     * above is machine state, the pixels below are only a picture. */
+    if (s_skip_line_draw)
+      return;
 
     if (ppu->renderFlags & kPpuRenderFlags_NewRenderer) {
       debug_server_on_ppu_line_drawn(line, 1, ppu->bgmode);

@@ -571,6 +571,12 @@ void ppu_reset(Ppu* ppu);
 bool ppu_checkOverscan(Ppu* ppu);
 void ppu_handleVblank(Ppu* ppu);
 void ppu_runLine(Ppu* ppu, int line);
+/* Catch-up frames (a netplay guest running extra frames to reach the host)
+ * are never shown: while set, ppu_runLine still evaluates sprites (range/time
+ * over stay exact for the game) but skips composing the line's pixels, the
+ * expensive part of a frame. Off by default; whoever sets it clears it. */
+void ppu_setSkipLineDraw(bool skip);
+bool ppu_skipLineDraw(void);
 
 /* Bind an additional XRGB8888 frame with 1..4 samples per native pixel in
  * each dimension. Width is 256 + twice the current centering budget; height

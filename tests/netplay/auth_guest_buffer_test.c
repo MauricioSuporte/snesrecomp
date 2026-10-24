@@ -37,6 +37,7 @@ int snes_netplay_state_barrier(void) { return 0; }
 int snes_netplay_is_running(void) { return 1; }
 const char *snes_netplay_transport_name(void) { return "ice"; }
 int snes_netplay_ice_failed(void) { return 0; }
+void snes_netplay_wait_report(void) {}
 int snes_netplay_connect_timed_out(uint32_t timeout) { (void)timeout; return 0; }
 int snes_netplay_input_desync(uint32_t *t, uint32_t *l, uint32_t *r)
 { (void)t; (void)l; (void)r; return 0; }
@@ -120,6 +121,40 @@ int main(void)
     assert(snes_host_auth_row_ready());
     lead = 0;
     assert(!snes_host_auth_row_ready());
+
+    /* Frame skip: a burst frame another one follows is never shown. With
+     * buffer 1, lead 7 gives a 3-frame burst after the admitted frame: frames
+     * 0..2 skip their picture, frame 3 (the last) is drawn. */
+    env_set("SNES_NET_CATCHUP_CAP_FAR", NULL);
+    env_set("SNES_NET_CATCHUP_DRAW_ALL", NULL);
+    lead = 7;
+    assert(snes_host_catchup_skip_draw(0));
+    lead = 6; assert(snes_host_catchup_skip_draw(1));
+    lead = 5; assert(snes_host_catchup_skip_draw(2));
+    lead = 4; assert(!snes_host_catchup_skip_draw(3));
+    /* Nothing queued past the buffer: the single frame is drawn. */
+    lead = 1; assert(!snes_host_catchup_skip_draw(0));
+    lead = 2; assert(!snes_host_catchup_skip_draw(0));
+    /* Far behind (12+ rows past the buffer) the cap opens to 8. */
+    lead = 13; assert(snes_host_catchup_budget() == 8);
+    lead = 12; assert(snes_host_catchup_budget() == 3);
+    lead = 40; assert(snes_host_catchup_skip_draw(7));
+    lead = 40; assert(!snes_host_catchup_skip_draw(8));
+    env_set("SNES_NET_CATCHUP_CAP_FAR", "5");
+    lead = 40; assert(snes_host_catchup_budget() == 5);
+    env_set("SNES_NET_CATCHUP_CAP_FAR", NULL);
+    /* SNES_NET_CATCHUP_CAP=0 still turns catch-up off, far or not. */
+    env_set("SNES_NET_CATCHUP_CAP", "0");
+    lead = 40; assert(snes_host_catchup_budget() == 0);
+    assert(!snes_host_catchup_skip_draw(0));
+    env_set("SNES_NET_CATCHUP_CAP", NULL);
+    env_set("SNES_NET_CATCHUP_DRAW_ALL", "1");
+    lead = 40; assert(!snes_host_catchup_skip_draw(0));
+    env_set("SNES_NET_CATCHUP_DRAW_ALL", NULL);
+    /* Lockstep peers never skip pictures. */
+    auth_guest = 0;
+    lead = 40; assert(!snes_host_catchup_skip_draw(0));
+    auth_guest = 1;
 
     /* Repeated starvation grows the buffer, never past 4. */
     clock_ms += 1000;

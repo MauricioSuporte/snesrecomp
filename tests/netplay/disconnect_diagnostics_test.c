@@ -33,6 +33,7 @@ int snes_netplay_state_barrier(void) { return 0; }
 int snes_netplay_is_running(void) { return 1; }
 const char *snes_netplay_transport_name(void) { return "lan"; }
 int snes_netplay_ice_failed(void) { return 0; }
+void snes_netplay_wait_report(void) {}
 int snes_netplay_connect_timed_out(uint32_t timeout) { (void)timeout; return 0; }
 int snes_netplay_input_desync(uint32_t *t, uint32_t *l, uint32_t *r)
 { (void)t; (void)l; (void)r; return 0; }

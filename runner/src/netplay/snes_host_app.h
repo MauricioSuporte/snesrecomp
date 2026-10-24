@@ -70,6 +70,10 @@ int snes_host_barrier_admit(int from_lobby, int *running,
  * burst after delay_sync_starvation clears; capped at 16).
  */
 int snes_host_catchup_budget(void);
+/* Host-authority guest: 1 when the burst frame about to run will be followed
+ * by another catch-up frame, so it is never presented and its picture can be
+ * skipped (ppu_setSkipLineDraw). */
+int snes_host_catchup_skip_draw(int burst);
 /* Host-authority guest: rows kept queued against network jitter (adaptive,
  * 1 by default; SNES_NET_AUTH_BUFFER pins it), and whether the host's next
  * row is here with that buffer intact, so the frame may run now instead of

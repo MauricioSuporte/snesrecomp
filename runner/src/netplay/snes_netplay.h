@@ -198,6 +198,14 @@ int  snes_netplay_input_delay(void);
  * the net_diag.jsonl samples (SNES_NET_DIAG=1). */
 void snes_netplay_note_frame(double frame_ms, int catchup);
 void snes_netplay_note_present(void);
+/* One catch-up frame simulated without composing its picture (the host's
+ * frame skip for a guest that fell behind); counted in net_diag and logs. */
+void snes_netplay_note_draw_skip(void);
+/* Call each wall tick while the session is not RUNNING yet. Rate-limited:
+ * logs which seats the start is waiting on (ready / heard but not ready /
+ * nothing received) and shows it on screen, instead of a silent black
+ * screen. */
+void snes_netplay_wait_report(void);
 /* 1 on a seated guest of a host-authoritative delay-sync match. */
 int  snes_netplay_host_authority_guest(void);
 /* 1 once such a guest can never be fed again (the host's ring no longer holds
