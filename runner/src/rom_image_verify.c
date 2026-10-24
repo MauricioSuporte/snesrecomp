@@ -1,6 +1,7 @@
 #include "rom_image_verify.h"
 
 #include "crc32.h"
+#include "host_paths.h"
 #include "sha256.h"
 
 #include <stdio.h>
@@ -10,6 +11,9 @@
 #ifdef _WIN32
 #  define WIN32_LEAN_AND_MEAN
 #  include <windows.h>
+#else
+#  include <dirent.h>
+#  include <sys/stat.h>
 #endif
 
 typedef struct RomImage {
@@ -144,4 +148,119 @@ int snesrecomp_rom_match_sha256(const char *path,
     fprintf(stderr,
             "[Launcher] ROM SHA-256 %s matches no known hash.\n", hex);
     return -1;
+}
+
+int snesrecomp_rom_sha256_equals(const char *path, const uint8_t expected[32]) {
+    FILE *f;
+    long raw_size;
+    uint8_t *data;
+    size_t header;
+    uint8_t actual[32];
+    if (!path || !path[0] || !expected) return 0;
+    f = fopen(path, "rb");
+    if (!f) return 0;
+    if (fseek(f, 0, SEEK_END) != 0 || (raw_size = ftell(f)) <= 0 ||
+        raw_size > (16L << 20) + 512 || fseek(f, 0, SEEK_SET) != 0) {
+        fclose(f);
+        return 0;
+    }
+    data = (uint8_t *)malloc((size_t)raw_size);
+    if (!data || fread(data, 1, (size_t)raw_size, f) != (size_t)raw_size) {
+        free(data);
+        fclose(f);
+        return 0;
+    }
+    fclose(f);
+    header = ((size_t)raw_size % 1024 == 512) ? 512 : 0;
+    sha256_compute(data + header, (size_t)raw_size - header, actual);
+    free(data);
+    return memcmp(actual, expected, 32) == 0;
+}
+
+static int rom_like_name(const char *name) {
+    static const char *const kExt[] = { ".sfc", ".smc", ".swc", ".fig" };
+    size_t n = strlen(name);
+    if (n < 5) return 0;
+    for (size_t i = 0; i < sizeof(kExt) / sizeof(kExt[0]); ++i) {
+        const char *e = name + n - 4;
+        int same = 1;
+        for (int k = 0; k < 4; ++k) {
+            char c = e[k];
+            if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+            if (c != kExt[i][k]) { same = 0; break; }
+        }
+        if (same) return 1;
+    }
+    return 0;
+}
+
+static int scan_dir_for(const char *dir, const uint8_t expected[32],
+                        char *out, size_t cap) {
+    char path[1200];
+#ifdef _WIN32
+    char pattern[1100];
+    WIN32_FIND_DATAA fd;
+    HANDLE h;
+    int ok = 0;
+    snprintf(pattern, sizeof(pattern), "%s\\*", dir);
+    h = FindFirstFileA(pattern, &fd);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    do {
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        if (!rom_like_name(fd.cFileName)) continue;
+        if (snprintf(path, sizeof(path), "%s/%s", dir, fd.cFileName) >= (int)sizeof(path))
+            continue;
+        if (snesrecomp_rom_sha256_equals(path, expected)) {
+            ok = snprintf(out, cap, "%s", path) < (int)cap;
+        }
+    } while (!ok && FindNextFileA(h, &fd));
+    FindClose(h);
+    return ok;
+#else
+    DIR *d = opendir(dir);
+    struct dirent *e;
+    int ok = 0;
+    if (!d) return 0;
+    while (!ok && (e = readdir(d)) != NULL) {
+        struct stat st;
+        if (!rom_like_name(e->d_name)) continue;
+        if (snprintf(path, sizeof(path), "%s/%s", dir, e->d_name) >= (int)sizeof(path))
+            continue;
+        if (stat(path, &st) != 0 || !S_ISREG(st.st_mode)) continue;
+        if (snesrecomp_rom_sha256_equals(path, expected)) {
+            ok = snprintf(out, cap, "%s", path) < (int)cap;
+        }
+    }
+    closedir(d);
+    return ok;
+#endif
+}
+
+int snesrecomp_rom_locate_sha256(const uint8_t expected[32], char *out, size_t cap) {
+    char dirs[SNESRECOMP_SEARCH_DIR_MAX][SNESRECOMP_SEARCH_PATH_LEN];
+    int n;
+    if (!expected || !out || cap == 0) return 0;
+    out[0] = '\0';
+    n = snesrecomp_rom_search_dirs(dirs, SNESRECOMP_SEARCH_DIR_MAX);
+    for (int i = 0; i < n; ++i)
+        if (scan_dir_for(dirs[i], expected, out, cap)) return 1;
+    return 0;
+}
+
+int snesrecomp_rom_locate_sha256_hex(const char *hex, char *out, size_t cap) {
+    uint8_t digest[32];
+    if (!hex || strlen(hex) != 64) return 0;
+    for (int i = 0; i < 32; ++i) {
+        unsigned v = 0;
+        for (int k = 0; k < 2; ++k) {
+            char c = hex[i * 2 + k];
+            v <<= 4;
+            if (c >= '0' && c <= '9') v |= (unsigned)(c - '0');
+            else if (c >= 'a' && c <= 'f') v |= (unsigned)(c - 'a' + 10);
+            else if (c >= 'A' && c <= 'F') v |= (unsigned)(c - 'A' + 10);
+            else return 0;
+        }
+        digest[i] = (uint8_t)v;
+    }
+    return snesrecomp_rom_locate_sha256(digest, out, cap);
 }

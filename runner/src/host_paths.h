@@ -46,6 +46,48 @@ int snesrecomp_exe_basename(char *out, size_t max_len);
  */
 int snesrecomp_anchor_to_exe_dir(void);
 
+
+/*
+ * Portable installs. A player copies the whole game folder to another
+ * machine (or another drive), so nothing a config file stores may depend on
+ * where that folder used to be.
+ *
+ * The GAME ROOT is the folder the player ships: the nearest directory, from
+ * the executable's own up to three levels above it, that holds the project
+ * tree (rom_identity.txt or snesrecomp/snesrecomp_cli.py) -- so a game rebuilt
+ * into <root>/build/ and the setup host at <root>/ share one root. Without the
+ * tree it is the executable's directory. No trailing separator.
+ */
+int snesrecomp_game_root_dir(char *out, size_t max_len);
+
+/*
+ * The form of `path` to WRITE into a config file (rom.cfg, mod state, ...):
+ * relative to the game root, with '/' separators, when the file lies inside
+ * it; the absolute path otherwise (a ROM kept in Downloads stays where it is).
+ * Returns 1 on success.
+ */
+int snesrecomp_portable_path(const char *path, char *out, size_t max_len);
+
+/*
+ * The path to OPEN for a value read back from a config file. An absolute path
+ * that opens is used as is; a relative one is tried against the game root,
+ * the executable's directory and the working directory. When none opens --
+ * an absolute path written on another machine, say -- the file's own name is
+ * looked for in each search directory (see below). Returns 1 with a readable
+ * file in `out`, 0 when nothing opened (then `out` holds the stored value made
+ * absolute against the game root, for messages).
+ */
+int snesrecomp_resolve_stored_path(const char *stored, char *out, size_t max_len);
+
+/*
+ * Directories a player is expected to drop ROMs into, most specific first,
+ * without duplicates: the game root and its roms/ folder, the executable's
+ * directory and its roms/ folder, the working directory and its roms/ folder.
+ * Returns how many were written (at most `max`).
+ */
+enum { SNESRECOMP_SEARCH_DIR_MAX = 8, SNESRECOMP_SEARCH_PATH_LEN = 1024 };
+int snesrecomp_rom_search_dirs(char dirs[][SNESRECOMP_SEARCH_PATH_LEN], int max);
+
 #ifdef __cplusplus
 }
 #endif

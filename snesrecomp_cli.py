@@ -101,6 +101,12 @@ def resolve_project_rom(project_root: pathlib.Path, names: list[str],
         if not path.is_absolute() and not re.match(r"[A-Za-z]:[\\/]", value):
             path = project_root / path
         if not path.is_file():
+            # A path written on another machine (the game folder was copied
+            # there): the same file name inside the project still counts.
+            name = re.split(r"[\\/]", value)[-1]
+            for folder in (project_root, project_root / "roms"):
+                if name and (folder / name).is_file():
+                    return folder / name
             raise ValueError(f"{source} names a ROM that does not exist: {value}")
         return path
 

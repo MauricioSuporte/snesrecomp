@@ -65,6 +65,7 @@
 #include "launcher.h"
 #include "launcher_cache.h"
 #include "host_paths.h"
+#include "rom_image_verify.h"
 #include "host_args.h"
 #include "host_relaunch.h"
 #include "keybinds.h"
@@ -2883,23 +2884,47 @@ static void netplay_poll_events(void *ctx, int *want_soft_exit) {
 /* The dump this project was generated from, if the player parked a copy next
  * to the executable or in the working directory. Not a requirement — it is
  * the habit tools/regen.sh documents, and skipping the prompt for someone
- * who already followed it is the whole point. */
+ * who already followed it is the whole point.
+ *
+ * Then any file in the game folder (the root a rebuilt game in build/ shares
+ * with the setup host, its roms/ folder, the executable's folder) whose
+ * SHA-256 is the expected one, under whatever name the player gave it -- so a
+ * folder copied to another PC with the ROM inside opens straight on PLAY. */
+static uint8_t g_rom_sha256[32];
+static int g_rom_identity_ok;
+
 static int FindRomBesideExe(char *out, size_t cap) {
   const char *name = g_game->rom_file;
   FILE *f;
-  if (!name || !name[0])
-    return 0;
-  if (snesrecomp_exe_dir_path(name, out, cap)) {
-    f = fopen(out, "rb");
+  if (name && name[0]) {
+    if (snesrecomp_exe_dir_path(name, out, cap)) {
+      f = fopen(out, "rb");
+      if (f) {
+        fclose(f);
+        return 1;
+      }
+    }
+    {
+      char root[1024];
+      if (snesrecomp_game_root_dir(root, sizeof(root)) &&
+          snprintf(out, cap, "%s/%s", root, name) < (int)cap) {
+        f = fopen(out, "rb");
+        if (f) {
+          fclose(f);
+          return 1;
+        }
+      }
+    }
+    f = fopen(name, "rb");
     if (f) {
       fclose(f);
+      if (!snesrecomp_abspath(name, out, cap))
+        snprintf(out, cap, "%s", name);
       return 1;
     }
   }
-  f = fopen(name, "rb");
-  if (f) {
-    fclose(f);
-    snprintf(out, cap, "%s", name);
+  if (g_rom_identity_ok && snesrecomp_rom_locate_sha256(g_rom_sha256, out, cap)) {
+    host_report_breadcrumb("rom found in the game folder: %s", out);
     return 1;
   }
   out[0] = '\0';
@@ -2912,9 +2937,7 @@ static int FindRomBesideExe(char *out, size_t cap) {
 
 /* The ROM this binary was generated from. File scope because both launcher
  * entries hand it to recomp-ui, and the console resolver checks against it. */
-static uint8_t g_rom_sha256[32];
 static uint32_t g_rom_crc32;
-static int g_rom_identity_ok;
 static const char *g_program_path;       /* argv[0]: keybinds.ini sits beside it */
 static const char *g_rom_path = "";      /* the running ROM, once resolved */
 
@@ -3148,6 +3171,11 @@ static void LauncherSeed(RecompLauncherCSettings *ls, RecompLauncherCGameInfo *g
   gi->num_players = game->num_players > 0 ? game->num_players : 1;
   gi->expected_crc = g_rom_crc32;
   gi->has_expected_crc = g_rom_identity_ok;
+#if defined(RECOMP_LAUNCHER_HAS_PORTABLE_PATHS)
+  /* rom.cfg & co. relative to the game folder: a copied folder keeps its ROM. */
+  gi->portable_path = snesrecomp_portable_path;
+  gi->resolve_stored_path = snesrecomp_resolve_stored_path;
+#endif
   gi->known_sha256 = g_rom_identity_ok
       ? (const uint8_t (*)[32])&g_rom_sha256 : NULL;
   gi->num_known_sha256 = g_rom_identity_ok ? 1 : 0;

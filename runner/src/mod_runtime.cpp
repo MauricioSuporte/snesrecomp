@@ -4,6 +4,8 @@
 
 #include "crc32.h"
 #include "sha256.h"
+#include "host_paths.h"
+#include "rom_image_verify.h"
 
 #include <algorithm>
 #include <array>
@@ -1189,9 +1191,9 @@ std::string option_value(Runtime& runtime, const Package& package,
                                              value->second;
 }
 
-std::string resource_path(Runtime& runtime, const Package& package,
-                          const Feature& feature,
-                          const Resource& resource) {
+std::string resource_path_stored(Runtime& runtime, const Package& package,
+                                 const Feature& feature,
+                                 const Resource& resource) {
     if (!resource.shared_key.empty()) {
         const auto shared = runtime.shared_resources.find(resource.shared_key);
         if (shared != runtime.shared_resources.end()) return shared->second;
@@ -1219,6 +1221,61 @@ std::string resource_path(Runtime& runtime, const Package& package,
 }
 
 bool sha256_file(const fs::path& path, std::string& out, std::string* error);
+bool validate_resource_file(const Resource& resource,
+                            const std::string& path_text,
+                            std::string* status);
+bool resource_is_directory(const Resource& resource);
+
+/* The path to use for a resource, wherever the game folder now lives. State
+ * files keep paths relative to the game root (see host_paths.h), and older
+ * ones hold absolute paths from the machine that wrote them; both are made
+ * to open here. A ROM resource that still does not verify is looked for by
+ * its digest in the game folder, so a friend who received the folder with
+ * the second ROM inside is never asked to select it. */
+std::string resource_path(Runtime& runtime, const Package& package,
+                          const Feature& feature,
+                          const Resource& resource) {
+    const std::string stored = resource_path_stored(runtime, package, feature, resource);
+    std::string candidate = stored;
+    if (!stored.empty()) {
+        char resolved[1024];
+        if (resource_is_directory(resource)) {
+            if (!fs::path(stored).is_absolute()) {
+                char root[1024];
+                if (snesrecomp_game_root_dir(root, sizeof(root)))
+                    candidate = (fs::path(root) / stored).lexically_normal().string();
+            }
+            return candidate;
+        }
+        if (snesrecomp_resolve_stored_path(stored.c_str(), resolved, sizeof(resolved)) ||
+            resolved[0])
+            candidate = resolved;
+        if (resource.normalized_sha256.empty() ||
+            validate_resource_file(resource, candidate, nullptr))
+            return candidate;
+    }
+    if (resource.normalized_sha256.size() != 64) return candidate;
+    /* One folder scan per digest, retried at most every few seconds while
+     * nothing is found: the Mods page asks for the status every frame. */
+    struct Located { std::string path; std::chrono::steady_clock::time_point at; };
+    static std::map<std::string, Located> located;
+    const auto now = std::chrono::steady_clock::now();
+    auto hit = located.find(resource.normalized_sha256);
+    if (hit != located.end()) {
+        if (!hit->second.path.empty() &&
+            validate_resource_file(resource, hit->second.path, nullptr))
+            return hit->second.path;
+        if (hit->second.path.empty() && now - hit->second.at < std::chrono::seconds(3))
+            return candidate;
+    }
+    char found[1024];
+    std::string path;
+    if (snesrecomp_rom_locate_sha256_hex(resource.normalized_sha256.c_str(),
+                                         found, sizeof(found)))
+        path = found;
+    located[resource.normalized_sha256] = Located{path, now};
+    return path.empty() ? candidate : path;
+}
 
 const SnesRomRevision* g_rom_catalog = nullptr;
 int g_rom_catalog_count = 0;
@@ -2891,8 +2948,16 @@ int provider_feature_resource_set_path(void*, const char* package_id,
         !find_resource(*package, feature_id, resource_id))
         return 0;
     const Resource* resource = find_resource(*package, feature_id, resource_id);
-    if (!resource->shared_key.empty()) state().shared_resources[resource->shared_key] = path;
-    else package_selection(state(), *package).features[feature_id].resources[resource_id] = path;
+    /* Kept relative to the game folder when the file is inside it, so the
+     * folder can be copied to another PC with the selection intact. */
+    std::string stored = path;
+    if (path[0]) {
+        char portable[1024];
+        if (snesrecomp_portable_path(path, portable, sizeof(portable)))
+            stored = portable;
+    }
+    if (!resource->shared_key.empty()) state().shared_resources[resource->shared_key] = stored;
+    else package_selection(state(), *package).features[feature_id].resources[resource_id] = stored;
     refresh_validation();
     state().error.clear();
     return 1;

@@ -54,10 +54,23 @@ int main(void) {
         strcmp(cached, rom_path) != 0)
         fail("resolver did not persist the selected ROM");
 
-    if (!snesrecomp_rom_cache_write("cache-roundtrip.sfc") ||
-        !snesrecomp_rom_cache_read(cached, sizeof(cached)) ||
-        strcmp(cached, "cache-roundtrip.sfc") != 0)
-        fail("ROM cache API did not round-trip");
+    /* A file in the game folder is stored relative to it, and read back as
+     * a path that opens wherever the folder now is. */
+    {
+        size_t n;
+        if (!snesrecomp_rom_cache_write("cache-roundtrip.sfc") ||
+            !snesrecomp_rom_cache_read(cached, sizeof(cached)))
+            fail("ROM cache API did not round-trip");
+        n = strlen(cached);
+        if (n < 20 || strcmp(cached + n - 20, "/cache-roundtrip.sfc") != 0)
+            fail("ROM cache API did not round-trip");
+        FILE *cf = fopen(cfg_path, "r");
+        char line[256] = "";
+        if (!cf || !fgets(line, sizeof(line), cf)) fail("rom.cfg unreadable");
+        fclose(cf);
+        if (strncmp(line, "cache-roundtrip.sfc", 19) != 0)
+            fail("rom.cfg did not store the game-folder-relative path");
+    }
 
     uint8_t sha[32];
     sha256_compute(payload, sizeof(payload), sha);

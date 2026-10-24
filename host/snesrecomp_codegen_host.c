@@ -1586,6 +1586,62 @@ static int run_cmake_build_posix(RecompLauncherCPrepareProgressFn on_progress,
 }
 #endif
 
+/* A build tree configured somewhere else -- the game folder was copied to
+ * another PC, drive or folder -- cannot be reused: CMakeCache.txt pins the
+ * old absolute source and build paths, and `cmake --build` then refuses
+ * ("the current CMakeCache.txt directory ... is different"). Drop the cache
+ * so the rebuild below configures afresh for where the tree is now; the
+ * compiled objects next to it are rebuilt as needed. */
+static void cache_path_norm(const char* in, char* out, size_t cap) {
+    size_t o = 0;
+    for (const char* p = in; *p && o + 1 < cap; ++p) {
+        char c = (*p == '\\') ? '/' : *p;
+        if (c == '/' && o && out[o - 1] == '/') continue;
+#if defined(_WIN32)
+        c = (char)tolower((unsigned char)c);
+#endif
+        out[o++] = c;
+    }
+    while (o > 1 && out[o - 1] == '/') --o;
+    out[o] = '\0';
+}
+
+static int cache_path_matches(const char* a, const char* b) {
+    char na[1400], nb[1400];
+    cache_path_norm(a, na, sizeof(na));
+    cache_path_norm(b, nb, sizeof(nb));
+    return strcmp(na, nb) == 0;
+}
+
+static void drop_moved_build_cache(void) {
+    char cache[1400], line[2048], files[1400];
+    FILE* f;
+    int moved = 0;
+    if (!join_path(cache, sizeof(cache), g_build_dir, "CMakeCache.txt") ||
+        !path_is_file(cache))
+        return;
+    f = fopen(cache, "r");
+    if (!f) return;
+    while (fgets(line, sizeof(line), f)) {
+        const char* key = "CMAKE_HOME_DIRECTORY:INTERNAL=";
+        size_t kn = strlen(key);
+        if (strncmp(line, key, kn) == 0) {
+            char* v = line + kn;
+            size_t n = strlen(v);
+            while (n && (v[n - 1] == '\n' || v[n - 1] == '\r')) v[--n] = '\0';
+            moved = !cache_path_matches(v, g_project_root);
+            break;
+        }
+    }
+    fclose(f);
+    if (!moved) return;
+    fprintf(stderr, "snesrecomp-codegen: build tree was configured in another "
+                    "folder; reconfiguring for %s\n", g_project_root);
+    remove(cache);
+    if (join_path(files, sizeof(files), g_build_dir, "CMakeFiles"))
+        rmtree_path(files);
+}
+
 static int host_rebuild_game(const char* rom_path, char* out_exe_path,
                              size_t out_cap, char* err_msg, size_t err_cap,
                              RecompLauncherCPrepareProgressFn on_progress,
@@ -1610,6 +1666,7 @@ static int host_rebuild_game(const char* rom_path, char* out_exe_path,
         snprintf(err_msg, err_cap, "CMake build environment is not available.");
         return 0;
     }
+    drop_moved_build_cache();
 
 #if defined(_WIN32)
     if (on_progress)
@@ -1645,6 +1702,55 @@ static int host_rebuild_game(const char* rom_path, char* out_exe_path,
     return 1;
 #endif
 }
+
+/* ── Build-version stamp ──────────────────────────────────────────────────
+ *
+ * "Is the rebuilt game in build/ the one this setup host belongs to?" used to
+ * be answered by file times alone. Times are whatever the copy left behind: a
+ * game folder zipped and unpacked on a friend's PC, or copied with Explorer,
+ * can make the setup host look newer than the game it already built, and the
+ * friend was sent back to Generate & rebuild with everything in place. The
+ * playable build now writes its version beside itself (<target>.build-version)
+ * and the setup host compares versions; times decide only without a stamp or
+ * for "dev" builds, whose version says nothing. */
+#if defined(SNES_GAME_VERSION)
+#  define SNESRECOMP_CODEGEN_VERSION SNES_GAME_VERSION
+#else
+#  define SNESRECOMP_CODEGEN_VERSION ""
+#endif
+
+static int build_stamp_path(const char* dir, char* out, size_t cap) {
+    char leaf[300];
+    if (!g_cfg || !g_cfg->exe_basename) return 0;
+    snprintf(leaf, sizeof(leaf), "%s.build-version", g_cfg->exe_basename);
+    return join_path(out, cap, dir, leaf);
+}
+
+#if defined(SNESRECOMP_SETUP_HOST)
+static int version_is_meaningful(const char* v) {
+    return v && v[0] && strcmp(v, "dev") != 0;
+}
+#else
+static void write_build_stamp(void) {
+    char path[1400], old[128] = "";
+    FILE* f;
+    const char* v = SNESRECOMP_CODEGEN_VERSION;
+    if (!g_exe_dir[0] || !build_stamp_path(g_exe_dir, path, sizeof(path))) return;
+    f = fopen(path, "r");
+    if (f) {
+        if (fgets(old, sizeof(old), f)) {
+            size_t n = strlen(old);
+            while (n && (old[n - 1] == '\n' || old[n - 1] == '\r')) old[--n] = '\0';
+        }
+        fclose(f);
+        if (strcmp(old, v) == 0) return;
+    }
+    f = fopen(path, "w");
+    if (!f) return;
+    fprintf(f, "%s\n", v);
+    fclose(f);
+}
+#endif
 
 /* ── Setup build → playable build handoff ────────────────────────────────
  *
@@ -1742,6 +1848,31 @@ static void handoff_to_rebuilt_or_return(void) {
      * update would look like it did nothing. Fall through to the wizard
      * instead -- and a false positive costs one no-op rebuild, because the
      * mtimes a zip carries are the packaging machine's. */
+    {
+        /* The version stamp settles it when there is one (see above). */
+        char stamp[1400], built[128] = "";
+        FILE* sf;
+        if (build_stamp_path(g_build_dir, stamp, sizeof(stamp)) &&
+            (sf = fopen(stamp, "r")) != NULL) {
+            if (fgets(built, sizeof(built), sf)) {
+                size_t n = strlen(built);
+                while (n && (built[n - 1] == '\n' || built[n - 1] == '\r'))
+                    built[--n] = '\0';
+            }
+            fclose(sf);
+        }
+        if (version_is_meaningful(built) &&
+            version_is_meaningful(SNESRECOMP_CODEGEN_VERSION)) {
+            if (strcmp(built, SNESRECOMP_CODEGEN_VERSION) != 0) {
+                fprintf(stderr,
+                        "snesrecomp-codegen: the rebuilt game is version %s, "
+                        "this setup is %s — rebuild before playing\n",
+                        built, SNESRECOMP_CODEGEN_VERSION);
+                return;
+            }
+            goto start_it;   /* same version: file times do not matter */
+        }
+    }
     if (have_self && file_is_newer(self, g_exe_path)) {
         fprintf(stderr,
                 "snesrecomp-codegen: %s is newer than the rebuilt game in "
@@ -1750,6 +1881,7 @@ static void handoff_to_rebuilt_or_return(void) {
         return;
     }
 
+start_it:
     fprintf(stderr,
             "snesrecomp-codegen: this is the setup build; the rebuilt game is "
             "%s — starting it instead\n", g_exe_path);
@@ -1802,9 +1934,14 @@ void snesrecomp_codegen_host_relaunch_or_exit(const char* rom_path) {
         exit(1);
     }
     if (rom_path && rom_path[0]) {
+        /* Relative to the game folder when the ROM is inside it, so the
+         * folder still opens on PLAY after being copied elsewhere. */
+        char stored[1024];
+        if (!snesrecomp_portable_path(rom_path, stored, sizeof(stored)))
+            snprintf(stored, sizeof(stored), "%s", rom_path);
         FILE* rc = fopen("rom.cfg", "w");
         if (rc) {
-            fprintf(rc, "%s\n", rom_path);
+            fprintf(rc, "%s\n", stored);
             fclose(rc);
         }
     }
@@ -1997,7 +2134,17 @@ void snesrecomp_codegen_host_apply(RecompLauncherCGameInfo* gi,
     const char* force_env =
         cfg_or(cfg->force_setup_env, "SNESRECOMP_FORCE_SETUP");
     const char* force = getenv(force_env);
-    if (snesrecomp_codegen_host_sources_missing(cfg) ||
+#if defined(SNESRECOMP_SETUP_HOST)
+    const int sources_missing = snesrecomp_codegen_host_sources_missing(cfg);
+#else
+    /* A playable build carries its game code: generated sources missing from
+     * the folder (a copy that left src/gen/ behind to save space) do not make
+     * it unplayable, so they are no reason to send the player to the wizard.
+     * Record which version this binary is for the setup host's handoff. */
+    const int sources_missing = 0;
+    write_build_stamp();
+#endif
+    if (sources_missing ||
         (force && force[0] && force[0] != '0')) {
         gi->needs_setup = 1;
         gi->prepare_required_before_continue = 1;
