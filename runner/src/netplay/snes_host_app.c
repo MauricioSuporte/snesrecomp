@@ -138,6 +138,20 @@ static void barrier_soft_exit(int from_lobby, int *running, const char *origin,
  * them. */
 #define SNES_AUTH_CATCHUP_FAR_ROWS 12
 #define SNES_AUTH_CATCHUP_CAP_FAR_DEFAULT 8
+/* Paced catch-up (2.2.4). 2.2.3 drained any surplus at once: on a fast PC
+ * whose host delivers rows in pairs, nearly every other frame became a
+ * two-frame step (200-290 skipped pictures per 5 s in the maintainer's log),
+ * so motion judders and sprites the game multiplexes on alternate frames
+ * vanish (the step always lands on the same parity). A small surplus is now
+ * spread out: one extra frame at most every fourth presented frame below
+ * SNES_AUTH_CATCHUP_MID_ROWS, every third below SNES_AUTH_CATCHUP_FAR_ROWS;
+ * only a guest really far behind runs multi-frame bursts. */
+#define SNES_AUTH_CATCHUP_MID_ROWS 4
+#define SNES_AUTH_CATCHUP_NEAR_EVERY 4
+#define SNES_AUTH_CATCHUP_MID_EVERY 3
+#define SNES_AUTH_CATCHUP_FAST_ROWS 30
+
+static int g_catchup_since; /* presented frames since the last extra frame */
 
 static struct {
   int latched;
@@ -176,6 +190,7 @@ static void starv_reset(void)
 {
   memset(&g_starv, 0, sizeof(g_starv));
   g_auth_buf.inited = 0; /* next match starts from the default buffer */
+  g_catchup_since = 0;
 }
 
 /*
@@ -194,6 +209,11 @@ static void starv_reset(void)
  * pins it. The host never waits either way, so this only moves the guest.
  */
 #define SNES_AUTH_BUFFER_START 1
+/* Never shrink below one row (2.2.3 allowed 0): with no row in hand every
+ * late datagram stalls the guest a frame and the next arrival is repaid as a
+ * double step -- a 30 Hz-looking judder that also hides objects the game
+ * flickers on alternate frames. One row costs ~16 ms of input lag. */
+#define SNES_AUTH_BUFFER_MIN 1
 #define SNES_AUTH_BUFFER_MAX 4
 #define SNES_AUTH_BUFFER_GROW_MS 3000u
 #define SNES_AUTH_BUFFER_CALM_MS 10000u
@@ -250,7 +270,7 @@ int snes_host_auth_buffer_rows(void)
   uint32_t now;
   auth_buf_init();
   now = (uint32_t)snes_netplay_clock_ms();
-  if (!g_auth_buf.pinned && g_auth_buf.target > 0 &&
+  if (!g_auth_buf.pinned && g_auth_buf.target > SNES_AUTH_BUFFER_MIN &&
       now - g_auth_buf.calm_since_ms >= SNES_AUTH_BUFFER_CALM_MS) {
     g_auth_buf.target--;
     g_auth_buf.calm_since_ms = now;
@@ -644,21 +664,55 @@ int snes_host_catchup_budget(void)
   return catchup_budget_at(snes_netplay_remote_lead());
 }
 
-/* Before running burst frame `burst` (0 = the frame the barrier admitted):
- * will another catch-up frame follow it? It consumes one queued row, so the
- * loop's check after it sees one row less. Only a host-authority guest skips
- * pictures; a frame followed by another is never presented, so its pixels
- * need not be composed. A wrong guess costs nothing worse than one frame
- * composed for nothing, or one stale picture. */
-int snes_host_catchup_skip_draw(int burst)
+/* Extra frames to run after the frame the barrier just admitted, decided
+ * once per presented frame. Every frame but the last of the burst is never
+ * shown, so its picture can be skipped (ppu_setSkipLineDraw).
+ *
+ * Lockstep peers keep the plain budget. A host-authority guest paces it by
+ * how far it is past its jitter buffer (rows queued beyond this frame):
+ *   1..3   one extra frame at most every 4th presented frame (~15 rows/s)
+ *   4..11  one extra frame at most every 3rd (~20 rows/s)
+ *   12..29 up to 3 extra per frame (SNES_NET_CATCHUP_CAP), a quarter of the gap
+ *   30+    up to 8 (SNES_NET_CATCHUP_CAP_FAR): a slow PC or a long stall
+ * SNES_NET_CATCHUP_CAP=0 turns catch-up off. */
+int snes_host_catchup_plan(void)
 {
-  int lead;
+  int lead, surplus, cap, far, extra = 0;
+
+  if (!snes_netplay_host_authority_guest())
+    return snes_host_catchup_budget();
+  cap = starv_env_int("SNES_NET_CATCHUP_CAP", SNES_AUTH_CATCHUP_CAP_DEFAULT);
+  if (cap <= 0)
+    return 0;
+  far = starv_env_int("SNES_NET_CATCHUP_CAP_FAR", SNES_AUTH_CATCHUP_CAP_FAR_DEFAULT);
+  if (far < cap)
+    far = cap;
+  lead = snes_netplay_remote_lead();
+  surplus = lead - 1 - starv_runway();
+  if (surplus <= 0)
+    extra = 0;
+  else if (surplus < SNES_AUTH_CATCHUP_MID_ROWS)
+    extra = g_catchup_since + 1 >= SNES_AUTH_CATCHUP_NEAR_EVERY ? 1 : 0;
+  else if (surplus < SNES_AUTH_CATCHUP_FAR_ROWS)
+    extra = g_catchup_since + 1 >= SNES_AUTH_CATCHUP_MID_EVERY ? 1 : 0;
+  else {
+    extra = surplus / 4;
+    if (extra < 1)
+      extra = 1;
+    if (extra > (surplus >= SNES_AUTH_CATCHUP_FAST_ROWS ? far : cap))
+      extra = surplus >= SNES_AUTH_CATCHUP_FAST_ROWS ? far : cap;
+  }
+  if (extra > surplus)
+    extra = surplus;
+  g_catchup_since = extra > 0 ? 0 : g_catchup_since + 1;
+  return extra;
+}
+
+int snes_host_catchup_skip_draw(int burst, int plan)
+{
   if (!snes_netplay_host_authority_guest())
     return 0;
   if (starv_env_int("SNES_NET_CATCHUP_DRAW_ALL", 0))
     return 0;
-  lead = snes_netplay_remote_lead() - 1;
-  if (lead < 1)
-    return 0;
-  return burst < catchup_budget_at(lead);
+  return burst < plan;
 }

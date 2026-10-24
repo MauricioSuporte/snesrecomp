@@ -2804,28 +2804,40 @@ static int netplay_test_input(uint16_t *out) {
   return 1;
 }
 
-/* Frame skip notice. A guest that keeps skipping pictures to stay with the
- * host is on a PC below 60 fps (or one busy with something else): say so on
- * screen, at most every 30 s, and log the share of frames skipped, so the
- * player knows why the picture is choppy and the report names the cause. */
-static void NetplayNoteFrameSkip(void) {
-  static uint32_t window_start, window_skips, last_notice;
+/* Frame skip notice. Skipped pictures alone do not mean a slow PC: a fast
+ * guest whose host delivers rows unevenly also catches up. Only when the
+ * frames it draws take most of a frame period is the PC itself behind; then
+ * say so on screen (at most every 30 s). Either way the log keeps the share
+ * of skipped pictures and the drawn-frame cost, so a report names the cause. */
+static void NetplayNoteFrameSkip(bool skipped, double frame_seconds) {
+  static uint32_t window_start, window_skips, window_drawn, last_notice;
+  static double drawn_seconds;
   uint32_t now = SDL_GetTicks();
   if (!window_start || now - window_start >= 5000u) {
     if (window_start && window_skips >= 60u) {
+      const double avg_ms = window_drawn ? drawn_seconds * 1000.0 / window_drawn : 0.0;
+      const bool slow_pc = avg_ms >= 0.85 * 1000.0 / g_simulation_hz;
       fprintf(stderr,
               "snes_netplay: frame_skip %u pictures skipped in %u ms to keep "
-              "up with the host (this PC is not holding 60 fps)\n",
-              (unsigned)window_skips, (unsigned)(now - window_start));
-      if (!last_notice || now - last_notice >= 30000u) {
+              "up with the host (drawn frame avg %.1f ms: %s)\n",
+              (unsigned)window_skips, (unsigned)(now - window_start), avg_ms,
+              slow_pc ? "this PC is not holding 60 fps"
+                      : "uneven arrival of the host's frames");
+      if (slow_pc && (!last_notice || now - last_notice >= 30000u)) {
         snes_osd_push("Slow PC: skipping frames to keep up with the host", 4000);
         last_notice = now;
       }
     }
     window_start = now ? now : 1u;
-    window_skips = 0;
+    window_skips = window_drawn = 0;
+    drawn_seconds = 0;
   }
-  window_skips++;
+  if (skipped) {
+    window_skips++;
+  } else {
+    window_drawn++;
+    drawn_seconds += frame_seconds;
+  }
 }
 
 static uint16_t netplay_capture_pad(void *ctx) {
@@ -4461,6 +4473,10 @@ error_reading:;
          * periods: events, the pad and audio stay serviced. */
         const double burst_limit = 2.0 / g_simulation_hz;
         double frame_cost = 0;
+        /* Extra frames for this presented frame, decided once: a guest
+         * spreads a small surplus over several presents instead of
+         * repaying it as back-to-back double steps (snes_host_app.c). */
+        const int plan = snes_host_catchup_plan();
         for (;;) {
           uint32 inputs = snes_netplay_published_inputs() | snes_netplay_active_mask();
           double net_frame_t0 = MonotonicSeconds();
@@ -4472,7 +4488,7 @@ error_reading:;
           const bool last_by_time =
               net_frame_t0 - burst_t0 + frame_cost > burst_limit;
           const bool skip_draw =
-              !last_by_time && snes_host_catchup_skip_draw(burst) != 0;
+              !last_by_time && snes_host_catchup_skip_draw(burst, plan) != 0;
           ppu_setSkipLineDraw(skip_draw);
           g_profile_frame = frameCtr + 1;
           double profile_start = ProfileStart();
@@ -4499,16 +4515,15 @@ error_reading:;
           snes_netplay_finish_frame();
           frame_cost = MonotonicSeconds() - net_frame_t0;
           snes_netplay_note_frame(frame_cost * 1000.0, burst > 0);
-          if (skip_draw) {
+          if (skip_draw)
             snes_netplay_note_draw_skip();
-            NetplayNoteFrameSkip();
-          }
+          NetplayNoteFrameSkip(skip_draw, frame_cost);
           if (run_frames && frameCtr >= run_frames) {
             running = false;
             exit_reason = "RUN_FRAMES reached";
             break;
           }
-          if (burst >= snes_host_catchup_budget())
+          if (burst >= plan)
             break;
           if (last_by_time)
             break;

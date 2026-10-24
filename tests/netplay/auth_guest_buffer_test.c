@@ -122,39 +122,58 @@ int main(void)
     lead = 0;
     assert(!snes_host_auth_row_ready());
 
-    /* Frame skip: a burst frame another one follows is never shown. With
-     * buffer 1, lead 7 gives a 3-frame burst after the admitted frame: frames
-     * 0..2 skip their picture, frame 3 (the last) is drawn. */
+    /* Paced catch-up (buffer 1; surplus = lead - 1 - buffer). */
     env_set("SNES_NET_CATCHUP_CAP_FAR", NULL);
     env_set("SNES_NET_CATCHUP_DRAW_ALL", NULL);
-    lead = 7;
-    assert(snes_host_catchup_skip_draw(0));
-    lead = 6; assert(snes_host_catchup_skip_draw(1));
-    lead = 5; assert(snes_host_catchup_skip_draw(2));
-    lead = 4; assert(!snes_host_catchup_skip_draw(3));
-    /* Nothing queued past the buffer: the single frame is drawn. */
-    lead = 1; assert(!snes_host_catchup_skip_draw(0));
-    lead = 2; assert(!snes_host_catchup_skip_draw(0));
-    /* Far behind (12+ rows past the buffer) the cap opens to 8. */
-    lead = 13; assert(snes_host_catchup_budget() == 8);
-    lead = 12; assert(snes_host_catchup_budget() == 3);
-    lead = 40; assert(snes_host_catchup_skip_draw(7));
-    lead = 40; assert(!snes_host_catchup_skip_draw(8));
-    env_set("SNES_NET_CATCHUP_CAP_FAR", "5");
-    lead = 40; assert(snes_host_catchup_budget() == 5);
-    env_set("SNES_NET_CATCHUP_CAP_FAR", NULL);
-    /* SNES_NET_CATCHUP_CAP=0 still turns catch-up off, far or not. */
-    env_set("SNES_NET_CATCHUP_CAP", "0");
-    lead = 40; assert(snes_host_catchup_budget() == 0);
-    assert(!snes_host_catchup_skip_draw(0));
-    env_set("SNES_NET_CATCHUP_CAP", NULL);
-    env_set("SNES_NET_CATCHUP_DRAW_ALL", "1");
-    lead = 40; assert(!snes_host_catchup_skip_draw(0));
-    env_set("SNES_NET_CATCHUP_DRAW_ALL", NULL);
-    /* Lockstep peers never skip pictures. */
-    auth_guest = 0;
-    lead = 40; assert(!snes_host_catchup_skip_draw(0));
-    auth_guest = 1;
+    {
+        int k, extras;
+        /* Nothing past the buffer: never an extra frame. */
+        lead = 2; g_catchup_since = 0;
+        for (k = 0; k < 10; ++k) assert(snes_host_catchup_plan() == 0);
+        /* Small surplus (1..3): one extra frame every 4th present. */
+        lead = 3; g_catchup_since = 0; extras = 0;
+        for (k = 0; k < 12; ++k) extras += snes_host_catchup_plan();
+        assert(extras == 3);
+        lead = 3; g_catchup_since = 0;
+        assert(snes_host_catchup_plan() == 0);
+        assert(snes_host_catchup_plan() == 0);
+        assert(snes_host_catchup_plan() == 0);
+        assert(snes_host_catchup_plan() == 1);
+        /* Mid surplus (4..11): every 3rd present. */
+        lead = 8; g_catchup_since = 0; extras = 0;
+        for (k = 0; k < 12; ++k) extras += snes_host_catchup_plan();
+        assert(extras == 4);
+        /* Far (12..29): a quarter of the gap, capped at 3, every present. */
+        lead = 18; g_catchup_since = 0;   /* surplus 16 */
+        assert(snes_host_catchup_plan() == 3);
+        assert(snes_host_catchup_plan() == 3);
+        lead = 14;                        /* surplus 12 */
+        assert(snes_host_catchup_plan() == 3);
+        /* Very far (30+): up to 8. */
+        lead = 42;                        /* surplus 40 */
+        assert(snes_host_catchup_plan() == 8);
+        env_set("SNES_NET_CATCHUP_CAP_FAR", "5");
+        assert(snes_host_catchup_plan() == 5);
+        env_set("SNES_NET_CATCHUP_CAP_FAR", NULL);
+        /* Only the burst's last frame is drawn. */
+        assert(snes_host_catchup_skip_draw(0, 3));
+        assert(snes_host_catchup_skip_draw(2, 3));
+        assert(!snes_host_catchup_skip_draw(3, 3));
+        assert(!snes_host_catchup_skip_draw(0, 0));
+        env_set("SNES_NET_CATCHUP_DRAW_ALL", "1");
+        assert(!snes_host_catchup_skip_draw(0, 3));
+        env_set("SNES_NET_CATCHUP_DRAW_ALL", NULL);
+        /* SNES_NET_CATCHUP_CAP=0 turns catch-up off, far or not. */
+        env_set("SNES_NET_CATCHUP_CAP", "0");
+        lead = 42; assert(snes_host_catchup_plan() == 0);
+        env_set("SNES_NET_CATCHUP_CAP", NULL);
+        /* Lockstep peers keep the plain budget (cap 0 by default) and never
+         * skip pictures. */
+        auth_guest = 0;
+        lead = 42; assert(snes_host_catchup_plan() == 0);
+        assert(!snes_host_catchup_skip_draw(0, 3));
+        auth_guest = 1;
+    }
 
     /* Repeated starvation grows the buffer, never past 4. */
     clock_ms += 1000;
@@ -170,14 +189,15 @@ int main(void)
     starve(); (void)rows_to_unlatch();
     assert(snes_host_auth_buffer_rows() == 4);
 
-    /* A calm stretch gives rows back, down to zero. */
+    /* A calm stretch gives rows back, down to one. */
     clock_ms += 10000; assert(snes_host_auth_buffer_rows() == 3);
     clock_ms += 10000; assert(snes_host_auth_buffer_rows() == 2);
     clock_ms += 10000; assert(snes_host_auth_buffer_rows() == 1);
-    clock_ms += 10000; assert(snes_host_auth_buffer_rows() == 0);
-    clock_ms += 10000; assert(snes_host_auth_buffer_rows() == 0);
+    /* Never below one row (SNES_AUTH_BUFFER_MIN). */
+    clock_ms += 10000; assert(snes_host_auth_buffer_rows() == 1);
+    clock_ms += 10000; assert(snes_host_auth_buffer_rows() == 1);
     lead = 0;
-    assert(snes_host_auth_row_ready());
+    assert(!snes_host_auth_row_ready());
 
     /* A new match starts over. */
     starv_reset();
