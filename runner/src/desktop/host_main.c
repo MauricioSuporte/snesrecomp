@@ -3732,10 +3732,24 @@ int snesrecomp_desktop_main(const SnesDesktopHostGame *game, int argc, char **ar
       const char *env_no_launcher = getenv("SNESRECOMP_NO_LAUNCHER");
       int want_launcher = !headless && !no_launcher && !(env_no_launcher && *env_no_launcher) &&
                           (force_launcher || !have_positional);
+#if defined(SNESRECOMP_SETUP_HOST)
+      /* A setup host has no game to boot: SnesInit refuses. The launcher is
+       * also where it hands off to the rebuilt game in build/ (codegen
+       * autowire), so skipping it -- SkipLauncher=1 carried into a fresh
+       * version folder by the AppImage after an update, or a ROM passed on
+       * the command line -- ended in "This is a setup build" every time.
+       * Always open it unless told explicitly not to; a ROM argument still
+       * preselects the ROM. */
+      if (!headless && !no_launcher && !(env_no_launcher && *env_no_launcher))
+        want_launcher = 1;
+      const int setup_host = 1;
+#else
+      const int setup_host = 0;
+#endif
 
       /* SkipLauncher: boot straight from the cached ROM. A missing/unreadable
-       * cache falls through to the launcher. */
-      if (want_launcher && !force_launcher && g_config.skip_launcher) {
+       * cache falls through to the launcher. Never in a setup host. */
+      if (want_launcher && !force_launcher && !setup_host && g_config.skip_launcher) {
         char cached[1024]; cached[0] = '\0';
         if (snesrecomp_rom_cache_read(cached, sizeof(cached)) && cached[0]) {
           FILE *probe = fopen(cached, "rb");
