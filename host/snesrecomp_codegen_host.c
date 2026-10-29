@@ -2189,5 +2189,18 @@ void snesrecomp_codegen_host_apply(RecompLauncherCGameInfo* gi,
      * launcher offers Play and SnesInit dies on the player. */
     gi->needs_setup = 1;
     gi->prepare_required_before_continue = 1;
+#if defined(RECOMP_LAUNCHER_HAS_PREPARE_AUTOSTART)
+    /* A rebuilt game is there but did not get the handoff: it is older than
+     * this setup (an update unpacked over a built folder). The player built
+     * once already and Generate & rebuild is the only way forward, so the
+     * wizard starts it by itself when the ROM is already known.
+     * SNESRECOMP_NO_AUTO_REBUILD=1 keeps the button manual. */
+    if (can_rebuild && g_exe_path[0] && path_is_file(g_exe_path) &&
+        !env_flag_set("SNESRECOMP_NO_AUTO_REBUILD")) {
+        gi->prepare_autostart = 1;
+        fprintf(stderr, "snesrecomp-codegen: the rebuilt game is out of date; "
+                        "Generate & rebuild starts automatically\n");
+    }
+#endif
 #endif
 }
