@@ -1401,8 +1401,16 @@ static int write_windows_deferred_rebuild_helper(char* err_msg, size_t err_cap) 
              * (PATH, CC/CXX, SDL3_DIR); calling it beats a second copy. */
             "if exist \"%%PACK%%\\env.bat\" call \"%%PACK%%\\env.bat\"\r\n"
             "cd /d \"%%ROOT%%\"\r\n"
-            /* A setup zip ships no build tree: configure on first rebuild. */
-            "if not exist \"%%BUILD_DIR%%\\CMakeCache.txt\" (\r\n"
+            /* A setup zip ships no build tree: configure on first rebuild.
+             * build.ninja, not CMakeCache.txt: a configure that failed or was
+             * closed leaves the cache behind, and keying on it skipped
+             * configure forever ("loading 'build.ninja'"). */
+            "if exist \"%%BUILD_DIR%%\\CMakeCache.txt\" if not exist "
+            "\"%%BUILD_DIR%%\\build.ninja\" (\r\n"
+            "  del /q \"%%BUILD_DIR%%\\CMakeCache.txt\"\r\n"
+            "  rmdir /s /q \"%%BUILD_DIR%%\\CMakeFiles\" 2>NUL\r\n"
+            ")\r\n"
+            "if not exist \"%%BUILD_DIR%%\\build.ninja\" (\r\n"
             /* Zip time is zone-less; files unpacked west of the packer sit
              * in the future and ninja regenerates forever. Pull them back. */
             "  powershell -NoProfile -Command \"Get-ChildItem -Recurse -File "
@@ -1518,10 +1526,29 @@ static int run_cmake_posix(char** cmake_args, int n_args, const char* what,
     return 0;
 }
 
+/* Configured means CMake both configured AND generated: CMakeCache.txt is
+ * written even when configure fails or is interrupted, and a tree holding only
+ * the cache made every later rebuild skip configure and die in
+ * `ninja: error: loading 'build.ninja'`, hiding the real configure error.
+ * Such a half tree is dropped so configure runs (and reports) again; the
+ * generator may differ this time, which CMake refuses over an old cache. */
 static int build_dir_is_configured(void) {
-    char cache[1400];
-    return join_path(cache, sizeof(cache), g_build_dir, "CMakeCache.txt") &&
-           path_is_file(cache);
+    char cache[1400], gen[1400], files[1400];
+    if (!join_path(cache, sizeof(cache), g_build_dir, "CMakeCache.txt") ||
+        !path_is_file(cache))
+        return 0;
+    if ((join_path(gen, sizeof(gen), g_build_dir, "build.ninja") &&
+         path_is_file(gen)) ||
+        (join_path(gen, sizeof(gen), g_build_dir, "Makefile") &&
+         path_is_file(gen)))
+        return 1;
+    step_log_open("incomplete build tree");
+    step_log_line("CMakeCache.txt without build.ninja or Makefile (an earlier "
+                  "configure stopped before generating); configuring again");
+    remove(cache);
+    if (join_path(files, sizeof(files), g_build_dir, "CMakeFiles"))
+        rmtree_path(files);
+    return 0;
 }
 
 /* First rebuild from a setup zip: there is no build tree yet, so configure
