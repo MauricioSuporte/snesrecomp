@@ -1417,6 +1417,13 @@ static int write_windows_deferred_rebuild_helper(char* err_msg, size_t err_cap) 
              * could not load cache". No cache means configure, always. */
             "if not exist \"%%BUILD_DIR%%\\CMakeCache.txt\" "
             "del /q \"%%BUILD_DIR%%\\build.ninja\" 2>NUL\r\n"
+            /* FetchContent sub-builds (_deps\\*-subbuild) keep their own
+             * cache with the old folder in it: configure then failed with
+             * "CMakeCache.txt directory ... is different" (libjuice). They
+             * are regenerated; the downloaded _deps\\*-src stays. */
+            "if not exist \"%%BUILD_DIR%%\\CMakeCache.txt\" "
+            "for /d %%%%D in (\"%%BUILD_DIR%%\\_deps\\*-subbuild\") do "
+            "rmdir /s /q \"%%%%D\"\r\n"
             "if not exist \"%%BUILD_DIR%%\\build.ninja\" (\r\n"
             /* Zip time is zone-less; files unpacked west of the packer sit
              * in the future and ninja regenerates forever. Pull them back. */
@@ -1652,6 +1659,46 @@ static int cache_path_matches(const char* a, const char* b) {
     return strcmp(na, nb) == 0;
 }
 
+/* FetchContent keeps a small CMake project per dependency in
+ * _deps/<name>-subbuild with its OWN CMakeCache.txt, which records the folder
+ * it was configured in. After the top-level cache is dropped for a moved or
+ * renamed folder, configure stopped at "The current CMakeCache.txt directory
+ * ... is different than the directory ... where CMakeCache.txt was created"
+ * (libjuice). The sub-builds are regenerated on configure; the downloaded
+ * _deps/<name>-src stays, so nothing is fetched again. */
+static void drop_fetchcontent_subbuilds(void) {
+    char deps[1200], sub[1500];
+    if (!join_path(deps, sizeof(deps), g_build_dir, "_deps") || !path_is_dir(deps))
+        return;
+#if defined(_WIN32)
+    {
+        char pattern[1300];
+        WIN32_FIND_DATAA fd;
+        HANDLE h;
+        snprintf(pattern, sizeof(pattern), "%s\\*-subbuild", deps);
+        h = FindFirstFileA(pattern, &fd);
+        if (h == INVALID_HANDLE_VALUE) return;
+        do {
+            if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+            if (join_path(sub, sizeof(sub), deps, fd.cFileName)) rmtree_path(sub);
+        } while (FindNextFileA(h, &fd));
+        FindClose(h);
+    }
+#else
+    {
+        DIR* d = opendir(deps);
+        struct dirent* e;
+        if (!d) return;
+        while ((e = readdir(d)) != NULL) {
+            size_t n = strlen(e->d_name), k = strlen("-subbuild");
+            if (n <= k || strcmp(e->d_name + n - k, "-subbuild") != 0) continue;
+            if (join_path(sub, sizeof(sub), deps, e->d_name)) rmtree_path(sub);
+        }
+        closedir(d);
+    }
+#endif
+}
+
 static void drop_moved_build_cache(void) {
     char cache[1400], line[2048], files[1400];
     FILE* f;
@@ -1679,6 +1726,7 @@ static void drop_moved_build_cache(void) {
     remove(cache);
     if (join_path(files, sizeof(files), g_build_dir, "CMakeFiles"))
         rmtree_path(files);
+    drop_fetchcontent_subbuilds();
 }
 
 static int host_rebuild_game(const char* rom_path, char* out_exe_path,
