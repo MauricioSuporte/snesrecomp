@@ -1428,11 +1428,16 @@ static int write_windows_deferred_rebuild_helper(char* err_msg, size_t err_cap) 
             ")\r\n"
             "echo Building...\r\n"
             /* The console shows the build live; the log keeps it for a
-             * failure report after the window has gone. */
-            "\"%%CMAKE%%\" --build \"%%BUILD_DIR%%\" --parallel "
-            "--target \"%%TARGET%%\" 2>&1 | "
-            "powershell -NoProfile -Command \"$input | Tee-Object -FilePath "
-            "'%%BUILD_DIR%%\\snesrecomp_rebuild.log' -Append\"\r\n"
+             * failure report after the window has gone. PowerShell runs cmake
+             * itself and exits with cmake's code: in a cmd pipe ("cmake |
+             * powershell Tee") errorlevel is the LAST command's, so a failed
+             * build passed as success and the old game was started instead.
+             * The paths travel as environment variables (set above), so no
+             * quoting of folder names is involved. */
+            "powershell -NoProfile -Command \"& $env:CMAKE --build $env:BUILD_DIR "
+            "--parallel --target $env:TARGET 2>&1 | ForEach-Object { [string]$_ } | "
+            "Tee-Object -FilePath (Join-Path $env:BUILD_DIR 'snesrecomp_rebuild.log') "
+            "-Append; exit $LASTEXITCODE\"\r\n"
             "if errorlevel 1 (\r\n"
             "  echo.\r\n"
             "  echo Build failed. Fix the errors above, then rebuild manually.\r\n"
