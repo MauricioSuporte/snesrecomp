@@ -1410,6 +1410,13 @@ static int write_windows_deferred_rebuild_helper(char* err_msg, size_t err_cap) 
             "  del /q \"%%BUILD_DIR%%\\CMakeCache.txt\"\r\n"
             "  rmdir /s /q \"%%BUILD_DIR%%\\CMakeFiles\" 2>NUL\r\n"
             ")\r\n"
+            /* The reverse: build.ninja without its cache. The ASCII-alias
+             * step above drops a cache configured through another path (a
+             * renamed or moved install folder) but left build.ninja, so
+             * configure was skipped and every build stopped at "Error:
+             * could not load cache". No cache means configure, always. */
+            "if not exist \"%%BUILD_DIR%%\\CMakeCache.txt\" "
+            "del /q \"%%BUILD_DIR%%\\build.ninja\" 2>NUL\r\n"
             "if not exist \"%%BUILD_DIR%%\\build.ninja\" (\r\n"
             /* Zip time is zone-less; files unpacked west of the packer sit
              * in the future and ninja regenerates forever. Pull them back. */
