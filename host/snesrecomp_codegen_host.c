@@ -1436,6 +1436,7 @@ static int write_windows_deferred_rebuild_helper(char* err_msg, size_t err_cap) 
             "  if errorlevel 1 (\r\n"
             "    echo.\r\n"
             "    echo Configure failed. Fix the errors above, then retry.\r\n"
+            "    echo failed> \"%%BUILD_DIR%%\\snesrecomp_rebuild_failed.txt\"\r\n"
             "    pause\r\n"
             "    exit /b 1\r\n"
             "  )\r\n"
@@ -1455,9 +1456,11 @@ static int write_windows_deferred_rebuild_helper(char* err_msg, size_t err_cap) 
             "if errorlevel 1 (\r\n"
             "  echo.\r\n"
             "  echo Build failed. Fix the errors above, then rebuild manually.\r\n"
+            "  echo failed> \"%%BUILD_DIR%%\\snesrecomp_rebuild_failed.txt\"\r\n"
             "  pause\r\n"
             "  exit /b 1\r\n"
             ")\r\n"
+            "del /q \"%%BUILD_DIR%%\\snesrecomp_rebuild_failed.txt\" 2>NUL\r\n"
             "echo Starting %%DISPLAY%%...\r\n"
             "start \"\" /D \"%%ROOT%%\" \"%%EXE%%\" --launcher\r\n"
             "endlocal\r\n");
@@ -2255,8 +2258,17 @@ void snesrecomp_codegen_host_apply(RecompLauncherCGameInfo* gi,
      * once already and Generate & rebuild is the only way forward, so the
      * wizard starts it by itself when the ROM is already known.
      * SNESRECOMP_NO_AUTO_REBUILD=1 keeps the button manual. */
+    /* Not after a failed rebuild: the Windows helper leaves this marker when
+     * configure or build fails, and starting again by itself on every launch
+     * kept the player from ever reaching the launcher (to update, say). The
+     * button is still there; a successful rebuild removes the marker. */
+    char failed_marker[1200];
+    const int last_failed =
+        join_path(failed_marker, sizeof(failed_marker), g_build_dir,
+                  "snesrecomp_rebuild_failed.txt") &&
+        path_is_file(failed_marker);
     if (can_rebuild && g_exe_path[0] && path_is_file(g_exe_path) &&
-        !env_flag_set("SNESRECOMP_NO_AUTO_REBUILD")) {
+        !last_failed && !env_flag_set("SNESRECOMP_NO_AUTO_REBUILD")) {
         gi->prepare_autostart = 1;
         fprintf(stderr, "snesrecomp-codegen: the rebuilt game is out of date; "
                         "Generate & rebuild starts automatically\n");
