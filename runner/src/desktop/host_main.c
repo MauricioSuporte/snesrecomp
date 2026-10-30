@@ -355,6 +355,18 @@ static void ProfileEnd(unsigned stage, double start) {
   }
   ++g_timings[stage].count;
 }
+/* Frames simulated but not drawn because the machine fell behind. */
+static unsigned g_frames_skipped;
+static bool g_frame_skipped_last;
+static bool FrameSkipAllowed(void) {
+  static int allowed = -1;
+  if (allowed < 0) {
+    const char *v = getenv("SNESRECOMP_NO_FRAME_SKIP");
+    allowed = !(v && atoi(v));
+  }
+  return allowed;
+}
+
 /* Silent blocks handed to the device because the emulator had not produced
  * enough sound yet (heard as crackling). Read by the slow-frame report. */
 static unsigned g_audio_underflow_blocks;
@@ -366,6 +378,7 @@ static unsigned g_audio_underflow_blocks;
 static void PerfWindowReport(unsigned frame) {
   static double window_start, previous[kProfileCount];
   static unsigned window_frame, previous_count[kProfileCount], previous_underflows, reports;
+  static unsigned previous_skipped;
   static double cpu_start;
   double now = MonotonicSeconds();
   if (window_start == 0) {
@@ -380,13 +393,16 @@ static void PerfWindowReport(unsigned frame) {
   double fps = frames / seconds;
   unsigned underflows = g_audio_underflow_blocks - previous_underflows;
   double cpu = ProcessCpuSeconds();
-  if ((fps < 58.0 || underflows > 0) && frames > 0 && (reports < 24 || reports % 12 == 0)) {
+  bool skipping = g_frames_skipped != previous_skipped;
+  if ((fps < 58.0 || underflows > 0 || skipping) && frames > 0 && (reports < 24 || reports % 12 == 0)) {
     static const char *names[kProfileCount] = {
       "guest", "raster", "acquire", "compose", "present", "trace", "hook", "events", "wait"
     };
     char line[512];
-    int n = snprintf(line, sizeof(line), "perf: %.1f fps, cpu %.0f%%, audio underflows %u, ms/frame",
-                     fps, cpu_start >= 0 && cpu >= cpu_start ? 100.0 * (cpu - cpu_start) / seconds : -1.0,
+    int n = snprintf(line, sizeof(line),
+                     "perf: %.1f fps, %u not drawn, cpu %.0f%%, audio underflows %u, ms/frame",
+                     fps, g_frames_skipped - previous_skipped,
+                     cpu_start >= 0 && cpu >= cpu_start ? 100.0 * (cpu - cpu_start) / seconds : -1.0,
                      underflows);
     for (unsigned i = 0; i < kProfileCount && n > 0 && n < (int)sizeof(line); ++i) {
       unsigned count = g_timings[i].count - previous_count[i];
@@ -396,12 +412,13 @@ static void PerfWindowReport(unsigned frame) {
     }
     host_report_breadcrumb("%s", line);
   }
-  if (fps < 58.0 || underflows > 0) ++reports;
+  if (fps < 58.0 || underflows > 0 || skipping) ++reports;
   for (unsigned i = 0; i < kProfileCount; ++i) {
     previous[i] = g_timings[i].total;
     previous_count[i] = g_timings[i].count;
   }
   previous_underflows = g_audio_underflow_blocks;
+  previous_skipped = g_frames_skipped;
   window_start = now;
   window_frame = frame;
   cpu_start = cpu;
@@ -4951,14 +4968,31 @@ error_reading:;
               frameCtr, crc32_compute(g_ram, 0x20000), g_cpu.A, g_cpu.X, g_cpu.Y,
               g_cpu.S, g_cpu.D, g_cpu.DB, g_cpu.PB, g_cpu.P);
     ProfileEnd(kProfileTrace, profile_start);
+    /* Frame skip on a slow machine: when this frame already ended past the
+     * start of the next one, do not draw it and keep the debt, so the next
+     * frame starts at once. The game keeps its speed and the sound queue stays
+     * fed; at worst every other frame is shown. Without it a PC whose
+     * drawing is slow (WSLg: ~7 ms per present) ran at ~50 fps and the sound
+     * crackled. SNESRECOMP_NO_FRAME_SKIP=1 turns it off. */
+    bool skip_present = false;
+    if (paced_realtime && !paced_custom && !g_netplay_session && FrameSkipAllowed()) {
+      double period = RtlLastFramePeriods() / video_clock.simulation_hz;
+      double late = MonotonicSeconds() - (video_clock.next_simulation + period);
+      if (late > 0 && late < 4.0 / video_clock.simulation_hz && !g_frame_skipped_last) {
+        skip_present = true;
+        ++g_frames_skipped;
+      }
+    }
+    g_frame_skipped_last = skip_present;
     if (paced_realtime) {
-      bool keep_debt = game->keep_pacing_debt && game->keep_pacing_debt();
+      bool keep_debt = skip_present ||
+          (game->keep_pacing_debt && game->keep_pacing_debt());
       snes_host_clock_simulation_done(&video_clock, MonotonicSeconds(), keep_debt,
                                       RtlLastFramePeriods());
     }
     else
       snes_host_clock_reset(&video_clock, MonotonicSeconds(), g_simulation_hz, presentation_hz);
-    if (!g_snes->disableRender &&
+    if (!g_snes->disableRender && !skip_present &&
         (!paced_custom || snes_host_clock_presentation_due(&video_clock, MonotonicSeconds()) ||
          (run_frames && frameCtr >= run_frames))) {
       double presented_at = MonotonicSeconds();
@@ -4995,9 +5029,9 @@ error_reading:;
     g_frame_timings = NULL;
   }
   host_report_breadcrumb("exit: %s after %u frames", exit_reason, frameCtr);
-  host_report_breadcrumb("video totals: simulations=%u presentations=%llu seconds=%.3f",
+  host_report_breadcrumb("video totals: simulations=%u presentations=%llu seconds=%.3f skipped=%u",
                          frameCtr, (unsigned long long)presentations,
-                         run_end - run_start);
+                         run_end - run_start, g_frames_skipped);
   host_report_breadcrumb("frame service: implementation=%s seconds=%.9f fps=%.3f cpu_seconds=%.9f",
       SNESRECOMP_FRAME_STAGING_HLE ? "HLE" : "LLE", run_end - run_start,
       run_end > run_start ? frameCtr / (run_end - run_start) : 0,
