@@ -2055,6 +2055,21 @@ static uint8 *g_audiobuffer, *g_audiobuffer_cur, *g_audiobuffer_end;
 static int g_frames_per_block;
 static uint8 g_audio_channels;
 static SDL_AudioDeviceID g_audio_device;
+/* Audio was asked for but no backend/device could open: run muted. */
+static bool g_audio_unavailable;
+
+#if defined(__linux__) && !defined(__ANDROID__)
+static bool HostIsWsl(void) {
+  if (getenv("WSL_DISTRO_NAME") || getenv("WSL_INTEROP")) return true;
+  FILE *f = fopen("/proc/sys/kernel/osrelease", "r");
+  if (!f) return false;
+  char buf[256] = { 0 };
+  size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+  fclose(f);
+  buf[n] = 0;
+  return strstr(buf, "microsoft") || strstr(buf, "Microsoft") || strstr(buf, "WSL");
+}
+#endif
 /* Only the thread executing guest work may wait for the audio consumer. */
 static _Thread_local bool g_audio_producer_active;
 static _Thread_local unsigned g_apu_lock_depth;
@@ -4013,10 +4028,27 @@ int snesrecomp_desktop_main(const SnesDesktopHostGame *game, int argc, char **ar
   SDL_SetMainReady();
   /* Return convention flipped in SDL3 (0 == success became true == success),
    * so this MUST go through the shim. */
+#if defined(__linux__) && !defined(__ANDROID__) && SNESRECOMP_SDL3
+  /* WSLg plays sound through a PulseAudio server over RDP; SDL's default
+   * device buffer (a few ms) underruns there and the sound crackles. */
+  if (HostIsWsl()) {
+    char frames[16];
+    snprintf(frames, sizeof(frames), "%d", IntMax(g_config.audio_samples, 2048));
+    SDL_SetHint(SDL_HINT_AUDIO_DEVICE_SAMPLE_FRAMES, frames);
+    host_report_breadcrumb("wsl: audio device buffer %s frames", frames);
+  }
+#endif
   if (!snesrecomp_sdl_init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_GAMECONTROLLER)) {
-    host_report_breadcrumb("SDL_Init FAILED: %s", SDL_GetError());
-    printf("Failed to init SDL: %s\n", SDL_GetError());
-    return 1;
+    /* No usable audio backend (Linux without ALSA/PulseAudio libraries, a
+     * machine without a sound device) must not keep the game from starting. */
+    host_report_breadcrumb("SDL_Init FAILED: %s; retrying without audio", SDL_GetError());
+    printf("Audio unavailable (%s); starting without sound\n", SDL_GetError());
+    g_audio_unavailable = true;
+    if (!snesrecomp_sdl_init(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER)) {
+      host_report_breadcrumb("SDL_Init FAILED: %s", SDL_GetError());
+      printf("Failed to init SDL: %s\n", SDL_GetError());
+      return 1;
+    }
   }
   host_report_breadcrumb("SDL init ok: video=%s audio=%s",
                          SDL_GetCurrentVideoDriver() ? SDL_GetCurrentVideoDriver() : "(none)",
@@ -4178,7 +4210,8 @@ error_reading:;
   }
 
   int audio_output_rate = 0;
-  if (g_config.enable_audio) {
+  SDL_AudioSpec want = { 0 }, have = { 0 };
+  if (g_config.enable_audio && !g_audio_unavailable) {
     /* Enumerate output devices into the breadcrumb ring: which device
      * SDL picks (and what else was available) is exactly the per-machine
      * variable a non-reproducible audio/boot crash report needs. */
@@ -4199,7 +4232,6 @@ error_reading:;
                                SDL_GetAudioDeviceName(i, 0));
 #endif
     }
-    SDL_AudioSpec want = { 0 }, have;
     want.freq = g_config.audio_freq;
     want.format = AUDIO_S16;
     want.channels = 2;
@@ -4219,10 +4251,17 @@ error_reading:;
     g_audio_device = SDL_OpenAudioDevice(NULL, 0, &want, &have, 0);
 #endif
     if (g_audio_device == 0) {
-      host_report_breadcrumb("audio device open FAILED: %s", SDL_GetError());
-      printf("Failed to open audio device: %s\n", SDL_GetError());
-      return 1;
+      host_report_breadcrumb("audio device open FAILED: %s; continuing without sound",
+                             SDL_GetError());
+      printf("Failed to open audio device (%s); starting without sound\n", SDL_GetError());
+#if SNESRECOMP_SDL3
+      if (g_audio_stream) SDL_DestroyAudioStream(g_audio_stream);
+      g_audio_stream = NULL;
+#endif
+      g_audio_unavailable = true;
     }
+  }
+  if (g_config.enable_audio && !g_audio_unavailable) {
     g_audio_channels = 2;
     /* The SPC's native rate is 32040 Hz (1.024 MHz / 32), not 32000. The
      * consumer converts onto the device rate and cannot infer it. */
