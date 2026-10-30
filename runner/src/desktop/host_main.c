@@ -355,6 +355,58 @@ static void ProfileEnd(unsigned stage, double start) {
   }
   ++g_timings[stage].count;
 }
+/* Silent blocks handed to the device because the emulator had not produced
+ * enough sound yet (heard as crackling). Read by the slow-frame report. */
+static unsigned g_audio_underflow_blocks;
+
+/* Slow-frame report, always on: every 5 s of play, when the game ran below
+ * ~58 fps or the sound ran dry, log where each frame's time went, so a
+ * player's log alone tells a slow CPU (guest), slow drawing (compose /
+ * upload-present) and a stalled clock (deadline-wait) apart. */
+static void PerfWindowReport(unsigned frame) {
+  static double window_start, previous[kProfileCount];
+  static unsigned window_frame, previous_count[kProfileCount], previous_underflows, reports;
+  static double cpu_start;
+  double now = MonotonicSeconds();
+  if (window_start == 0) {
+    window_start = now;
+    window_frame = frame;
+    cpu_start = ProcessCpuSeconds();
+    return;
+  }
+  double seconds = now - window_start;
+  if (seconds < 5.0) return;
+  unsigned frames = frame - window_frame;
+  double fps = frames / seconds;
+  unsigned underflows = g_audio_underflow_blocks - previous_underflows;
+  double cpu = ProcessCpuSeconds();
+  if ((fps < 58.0 || underflows > 0) && frames > 0 && (reports < 24 || reports % 12 == 0)) {
+    static const char *names[kProfileCount] = {
+      "guest", "raster", "acquire", "compose", "present", "trace", "hook", "events", "wait"
+    };
+    char line[512];
+    int n = snprintf(line, sizeof(line), "perf: %.1f fps, cpu %.0f%%, audio underflows %u, ms/frame",
+                     fps, cpu_start >= 0 && cpu >= cpu_start ? 100.0 * (cpu - cpu_start) / seconds : -1.0,
+                     underflows);
+    for (unsigned i = 0; i < kProfileCount && n > 0 && n < (int)sizeof(line); ++i) {
+      unsigned count = g_timings[i].count - previous_count[i];
+      if (!count) continue;
+      n += snprintf(line + n, sizeof(line) - n, " %s=%.2f", names[i],
+                    (g_timings[i].total - previous[i]) * 1000.0 / frames);
+    }
+    host_report_breadcrumb("%s", line);
+  }
+  if (fps < 58.0 || underflows > 0) ++reports;
+  for (unsigned i = 0; i < kProfileCount; ++i) {
+    previous[i] = g_timings[i].total;
+    previous_count[i] = g_timings[i].count;
+  }
+  previous_underflows = g_audio_underflow_blocks;
+  window_start = now;
+  window_frame = frame;
+  cpu_start = cpu;
+}
+
 static void WaitUntil(double deadline) {
   double profile_start = ProfileStart();
   /* Short deadline wait: a fixed 1ms sleep on every presentation-only
@@ -2153,6 +2205,7 @@ static void FillAudioBuffer(Uint8 *stream, int len) {
          * like any other underrun rather than hiding it from diagnostics. */
         memset(g_audiobuffer, 0, g_frames_per_block * g_audio_channels * sizeof(int16));
         audio_trace_on_output_underflow(available, g_frames_per_block);
+        ++g_audio_underflow_blocks;
       } else {
         g_audio_primed = true;
         RtlRenderAudio((int16 *)g_audiobuffer, g_frames_per_block, g_audio_channels);
@@ -2242,11 +2295,12 @@ static bool SdlRenderer_Init(SDL_Window *window) {
     printf("Failed to create renderer: %s\n", SDL_GetError());
     return false;
   }
-  if (kDebugFlag || HostGetenv("HOST_PROFILE") || HostGetenv("FRAME_TIMING")) {
+  {
+    /* Always logged: "software" here explains a slow game on its own. */
     const char *name = snesrecomp_sdl_renderer_name(renderer);
-    printf("Renderer: %s (vsync=%d display_hz=%.3f simulation_hz=%.6f)\n",
-           name ? name : "(unknown)", snesrecomp_sdl_get_render_vsync(renderer),
-           DisplayRefresh(), g_simulation_hz);
+    host_report_breadcrumb("sdl renderer: %s (vsync=%d display_hz=%.3f simulation_hz=%.6f)",
+                           name ? name : "(unknown)", snesrecomp_sdl_get_render_vsync(renderer),
+                           DisplayRefresh(), g_simulation_hz);
   }
   g_renderer = renderer;
 
@@ -4197,6 +4251,10 @@ error_reading:;
   host_report_breadcrumb("renderer initialized: %s",
       g_config.output_method == kOutputMethod_OpenGL ? "opengl" :
       g_config.output_method == kOutputMethod_SDLSoftware ? "sdl-software" : "sdl");
+  host_report_breadcrumb("display: %s, %.2f Hz, video driver %s, GALLIUM_DRIVER=%s",
+      (SDL_GetWindowFlags(window) & SDL_WINDOW_FULLSCREEN) ? "fullscreen" : "windowed", DisplayRefresh(),
+      SDL_GetCurrentVideoDriver() ? SDL_GetCurrentVideoDriver() : "(none)",
+      getenv("GALLIUM_DRIVER") ? getenv("GALLIUM_DRIVER") : "(unset)");
 
   g_audio_mutex = SDL_CreateMutex();
   if (!g_audio_mutex) Die("No mutex");
@@ -4331,8 +4389,11 @@ error_reading:;
   uint64_t presentations = 0;
   const char *frame_timing_path = HostGetenv("FRAME_TIMING");
   if (frame_timing_path) g_frame_timings = calloc(kFrameTimingCapacity, sizeof(*g_frame_timings));
-  bool profile_requested = g_frame_timings ||
+  /* Stage timing is always collected (a clock read per stage) for the
+   * slow-frame report; HOST_PROFILE only adds the exit summary below. */
+  bool profile_summary = g_frame_timings ||
       (HostGetenv("HOST_PROFILE") && atoi(HostGetenv("HOST_PROFILE")) != 0);
+  bool profile_requested = true;
   unsigned profile_first = HostGetenv("HOST_PROFILE_START_FRAME")
       ? (unsigned)strtoul(HostGetenv("HOST_PROFILE_START_FRAME"), NULL, 10) : 1;
   if (!profile_first) profile_first = 1;
@@ -4372,6 +4433,7 @@ error_reading:;
       snes_rewind_configure();
       g_state_generation = RtlStateGeneration();
     }
+    PerfWindowReport(frameCtr);
     SDL_Event event;
 
     /* Inert unless SNESRECOMP_CRASH_TEST is set — support drill for the
@@ -4941,7 +5003,7 @@ error_reading:;
       run_end > run_start ? frameCtr / (run_end - run_start) : 0,
       run_cpu_start >= 0 && run_cpu_end >= run_cpu_start
           ? run_cpu_end - run_cpu_start : -1);
-  if (g_profile) {
+  if (g_profile && profile_summary) {
     double profile_seconds = run_end - profile_window_start;
     host_report_breadcrumb("video profile window: first=%u last=%u seconds=%.6f presentations=%u",
         profile_first, frameCtr, profile_seconds, g_timings[kProfilePresent].count);
