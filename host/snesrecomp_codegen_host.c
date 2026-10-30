@@ -728,8 +728,25 @@ static int extract_zip(const char* zip, const char* dest, char* err, size_t cap)
     if (!run_cmdline_wait(cmd, &code) || code != 0) {
         snprintf(cmd, sizeof(cmd), "unzip -q \"%s\" -d \"%s\"", zip, dest);
         if (!run_cmdline_wait(cmd, &code) || code != 0) {
+#if !defined(_WIN32)
+            /* GNU tar cannot read zip and unzip is missing on a fresh Ubuntu;
+             * bsdtar or python3 (present on most desktops) can. */
+            snprintf(cmd, sizeof(cmd), "bsdtar -xf \"%s\" -C \"%s\"", zip, dest);
+            if (!run_cmdline_wait(cmd, &code) || code != 0) {
+                snprintf(cmd, sizeof(cmd), "python3 -m zipfile -e \"%s\" \"%s\"", zip, dest);
+                if (!run_cmdline_wait(cmd, &code) || code != 0) {
+                    snprintf(err, cap, "Failed to extract the toolchain zip. Install unzip "
+                             "(e.g. sudo apt install unzip) and try again.");
+                    return 0;
+                }
+                /* python's zipfile drops Unix permission bits. */
+                snprintf(cmd, sizeof(cmd), "chmod -R u+x \"%s\"", dest);
+                run_cmdline_wait(cmd, &code);
+            }
+#else
             snprintf(err, cap, "Failed to extract the toolchain zip (tar/unzip).");
             return 0;
+#endif
         }
     }
     char root[1400];
@@ -856,7 +873,11 @@ static int shell_wrap_argv(char** argv_in, int argc_in, char** argv_out, int cap
         "if [ -n \"$0\" ] && [ -f \"$0/env.sh\" ]; then . \"$0/env.sh\"; fi; exec \"$@\"";
     if (argc_in + 5 > cap_out) return 0;
     int n = 0;
-    argv_out[n++] = "/bin/sh";
+    /* env.sh uses bash syntax (BASH_SOURCE, [[ ]]). Debian/Ubuntu's /bin/sh is
+     * dash, which fails on it and leaves CC/CXX pointing at a bin/clang under
+     * the current directory, so cmake finds no compiler. Use bash when present. */
+    argv_out[n++] = path_is_file("/bin/bash") ? "/bin/bash"
+                  : path_is_file("/usr/bin/bash") ? "/usr/bin/bash" : "/bin/sh";
     argv_out[n++] = "-c";
     argv_out[n++] = script;
     argv_out[n++] = g_toolchain_root;   /* $0 -- "" when there is no pack */
