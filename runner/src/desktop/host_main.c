@@ -176,8 +176,10 @@ static void PollKeyboardControls(const uint8_t *keys);
 static void RequestScreenshot(void);
 #ifndef __ANDROID__
 void OpenGLRenderer_Create(struct RendererFuncs *funcs);
-#include "opengl.h"   /* snesrecomp_opengl_set_vsync */
 #endif
+/* Declarations only (no GL headers): the window-overlay quad type is shared
+ * with the SDL_Renderer chat path, which Android uses too. */
+#include "opengl.h"   /* snesrecomp_opengl_set_vsync, SnesWindowOverlayQuad */
 
 /* ── Symbols the framework leaves to the host ─────────────────────────────── */
 
