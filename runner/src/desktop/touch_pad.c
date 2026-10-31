@@ -22,27 +22,45 @@
 typedef struct PadLayout {
   float dpad_x, dpad_y, dpad_r;
   float face_x, face_y, face_r, face_off;
-  float lr_w, lr_h, lr_m;
-  float pill_w, pill_h, pill_y, pill_dx;
+  float lr_w, lr_h, l_x, r_x, lr_y;
+  float pill_w, pill_h, pill_y, sel_x, start_x;   /* sel_x/start_x: left edges */
 } PadLayout;
 
+/* Sizes come from the short side (u), so a portrait phone does not get
+ * landscape-height buttons. Landscape: L/R in the top corners and
+ * Select/Start at the bottom centre, beside the picture. Portrait: the
+ * picture sits above, so both rows stack above the d-pad and face buttons. */
 static PadLayout pad_layout(int w, int h) {
   PadLayout L;
-  const float u = (float)h, m = 0.045f * u;
+  const bool portrait = h > w;
+  const float u = (float)(portrait ? w : h), m = 0.045f * u;
   L.dpad_r = 0.20f * u;
   L.dpad_x = m + L.dpad_r;
-  L.dpad_y = u - m - L.dpad_r;
+  L.dpad_y = (float)h - m - L.dpad_r;
   L.face_r = 0.075f * u;
   L.face_off = 0.13f * u;
   L.face_x = (float)w - m - L.face_off - L.face_r;
-  L.face_y = u - m - L.face_off - L.face_r;
+  L.face_y = (float)h - m - L.face_off - L.face_r;
   L.lr_w = 0.30f * u;
   L.lr_h = 0.11f * u;
-  L.lr_m = 0.025f * u;
   L.pill_w = 0.19f * u;
   L.pill_h = 0.065f * u;
-  L.pill_y = u - 0.035f * u - L.pill_h;
-  L.pill_dx = 0.12f * u;
+  if (!portrait) {
+    L.l_x = 0.025f * u;
+    L.r_x = (float)w - 0.025f * u - L.lr_w;
+    L.lr_y = 0.025f * u;
+    L.pill_y = (float)h - 0.035f * u - L.pill_h;
+    L.sel_x = w * 0.5f - 0.12f * u - L.pill_w * 0.5f;
+    L.start_x = w * 0.5f + 0.12f * u - L.pill_w * 0.5f;
+  } else {
+    const float top = L.dpad_y - L.dpad_r - 0.05f * u;   /* above the clusters */
+    L.pill_y = top - L.pill_h;
+    L.sel_x = w * 0.5f - 0.04f * u - L.pill_w;
+    L.start_x = w * 0.5f + 0.04f * u;
+    L.lr_y = L.pill_y - 0.06f * u - L.lr_h;
+    L.l_x = m;
+    L.r_x = (float)w - m - L.lr_w;
+  }
   return L;
 }
 
@@ -89,15 +107,12 @@ uint32_t touch_pad_hit(float x, float y, int w, int h) {
     if (dx * dx + dy * dy <= (L.face_r * 1.45f) * (L.face_r * 1.45f))
       b |= kFace[i].bit;
   }
-  if (in_rect(x, y, L.lr_m, L.lr_m, L.lr_w, L.lr_h, L.lr_m))
-    b |= kTouchPad_L;
-  if (in_rect(x, y, (float)w - L.lr_m - L.lr_w, L.lr_m, L.lr_w, L.lr_h, L.lr_m))
-    b |= kTouchPad_R;
-  if (in_rect(x, y, w * 0.5f - L.pill_dx - L.pill_w * 0.5f, L.pill_y, L.pill_w,
-              L.pill_h, L.pill_h * 0.4f))
+  const float lr_pad = L.lr_h * 0.25f, pill_pad = L.pill_h * 0.4f;
+  if (in_rect(x, y, L.l_x, L.lr_y, L.lr_w, L.lr_h, lr_pad)) b |= kTouchPad_L;
+  if (in_rect(x, y, L.r_x, L.lr_y, L.lr_w, L.lr_h, lr_pad)) b |= kTouchPad_R;
+  if (in_rect(x, y, L.sel_x, L.pill_y, L.pill_w, L.pill_h, pill_pad))
     b |= kTouchPad_Select;
-  if (in_rect(x, y, w * 0.5f + L.pill_dx - L.pill_w * 0.5f, L.pill_y, L.pill_w,
-              L.pill_h, L.pill_h * 0.4f))
+  if (in_rect(x, y, L.start_x, L.pill_y, L.pill_w, L.pill_h, pill_pad))
     b |= kTouchPad_Start;
   return b;
 }
@@ -245,10 +260,24 @@ static void ring(float cx, float cy, float r0, float r1, Rgba c) {
   }
 }
 static void pill(float x, float y, float w, float h, Rgba c) {
-  const float r = h * 0.5f;
-  rect(x + r, y, w - 2 * r, h, c);
-  ring(x + r, y + r, 0, r, c);
-  ring(x + w - r, y + r, 0, r, c);
+  /* One convex outline fanned from the centre: overlapping pieces would
+   * double the alpha where they meet. */
+  const float r = h * 0.5f, cx = x + w * 0.5f, cy = y + r;
+  const int n = 16;
+  float px[2 * (n + 1)], py[2 * (n + 1)];
+  int k = 0;
+  for (int i = 0; i <= n; ++i, ++k) {   /* right cap, top to bottom */
+    const float a = -1.5707963f + 3.1415926f * i / n;
+    px[k] = x + w - r + cosf(a) * r; py[k] = cy + sinf(a) * r;
+  }
+  for (int i = 0; i <= n; ++i, ++k) {   /* left cap, bottom to top */
+    const float a = 1.5707963f + 3.1415926f * i / n;
+    px[k] = x + r + cosf(a) * r; py[k] = cy + sinf(a) * r;
+  }
+  for (int i = 0; i < k; ++i) {
+    const int j = (i + 1) % k;
+    tri(cx, cy, px[i], py[i], px[j], py[j], c);
+  }
 }
 
 /* Authored 3x5 capitals (rows top to bottom, bit 2 = left column). */
@@ -288,12 +317,12 @@ void touch_pad_draw(void *renderer, int w, int h) {
   const uint32_t held = touch_pad_buttons();
   const Rgba base = { 255, 255, 255, 46 }, edge = { 255, 255, 255, 110 },
              on = { 160, 200, 255, 150 }, ink = { 255, 255, 255, 190 };
-  const float px = 0.012f * h;
+  const float px = 0.012f * (h < w ? h : w);
   s_nv = 0;
 
   /* D-pad: disc, cross, lit arms. */
   ring(L.dpad_x, L.dpad_y, 0, L.dpad_r, base);
-  ring(L.dpad_x, L.dpad_y, L.dpad_r - 0.012f * h, L.dpad_r, edge);
+  ring(L.dpad_x, L.dpad_y, L.dpad_r - 0.06f * L.dpad_r, L.dpad_r, edge);
   {
     const float arm = L.dpad_r * 0.36f, len = L.dpad_r * 0.86f;
     rect(L.dpad_x - arm * 0.5f, L.dpad_y - len, arm, 2 * len, base);
@@ -308,22 +337,20 @@ void touch_pad_draw(void *renderer, int w, int h) {
     const float cx = L.face_x + kFace[i].dx * L.face_off;
     const float cy = L.face_y + kFace[i].dy * L.face_off;
     ring(cx, cy, 0, L.face_r, (held & kFace[i].bit) ? on : base);
-    ring(cx, cy, L.face_r - 0.01f * h, L.face_r, edge);
+    ring(cx, cy, L.face_r - 0.13f * L.face_r, L.face_r, edge);
     const char s[2] = { kFace[i].label, 0 };
     text(s, cx, cy, px * 1.6f, ink);
   }
   /* Shoulders. */
   {
-    const float rx = (float)w - L.lr_m - L.lr_w;
-    pill(L.lr_m, L.lr_m, L.lr_w, L.lr_h, (held & kTouchPad_L) ? on : base);
-    pill(rx, L.lr_m, L.lr_w, L.lr_h, (held & kTouchPad_R) ? on : base);
-    text("L", L.lr_m + L.lr_w * 0.5f, L.lr_m + L.lr_h * 0.5f, px * 1.4f, ink);
-    text("R", rx + L.lr_w * 0.5f, L.lr_m + L.lr_h * 0.5f, px * 1.4f, ink);
+    pill(L.l_x, L.lr_y, L.lr_w, L.lr_h, (held & kTouchPad_L) ? on : base);
+    pill(L.r_x, L.lr_y, L.lr_w, L.lr_h, (held & kTouchPad_R) ? on : base);
+    text("L", L.l_x + L.lr_w * 0.5f, L.lr_y + L.lr_h * 0.5f, px * 1.4f, ink);
+    text("R", L.r_x + L.lr_w * 0.5f, L.lr_y + L.lr_h * 0.5f, px * 1.4f, ink);
   }
   /* Select / Start. */
   {
-    const float sx = w * 0.5f - L.pill_dx - L.pill_w * 0.5f;
-    const float tx = w * 0.5f + L.pill_dx - L.pill_w * 0.5f;
+    const float sx = L.sel_x, tx = L.start_x;
     pill(sx, L.pill_y, L.pill_w, L.pill_h, (held & kTouchPad_Select) ? on : base);
     pill(tx, L.pill_y, L.pill_w, L.pill_h, (held & kTouchPad_Start) ? on : base);
     text("SELECT", sx + L.pill_w * 0.5f, L.pill_y + L.pill_h * 0.5f, px * 0.7f, ink);

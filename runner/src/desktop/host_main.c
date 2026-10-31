@@ -2654,6 +2654,10 @@ static void SdlRenderer_BeginDraw(int width, int height, uint8 **pixels, int *pi
                                     g_config.ignore_aspect_ratio, false, &viewport);
   if (g_game->compute_viewport)
     g_game->compute_viewport(width, height, output_width, output_height, &viewport);
+  /* Portrait with the on-screen pad: the picture goes to the top, leaving
+   * the bottom of the screen to the controls. */
+  if (touch_pad_enabled() && output_height > output_width && viewport.y > 0)
+    viewport.y = (int)(output_height * 0.04f);
   g_sdl_present_rect.x = viewport.x;
   g_sdl_present_rect.y = viewport.y;
   g_sdl_present_rect.w = viewport.width;
@@ -3679,6 +3683,10 @@ int snesrecomp_desktop_main(const SnesDesktopHostGame *game, int argc, char **ar
 #endif
   signal(SIGABRT, crash_handler);
 #ifdef __ANDROID__
+  /* SDL2 on Android lists the accelerometer as a joystick by default; the
+   * host opens unmapped joysticks as controllers, so tilting the phone moved
+   * the player and the menu cursors. Must precede SDL_Init. */
+  SDL_SetHint(SDL_HINT_ACCELEROMETER_AS_JOYSTICK, "0");
   /* All relative I/O (config.ini, rom.cfg, saves/, last_run_report.json)
    * lands in the app's external files dir, which is adb-pushable. */
   {
