@@ -3686,7 +3686,7 @@ int snesrecomp_desktop_main(const SnesDesktopHostGame *game, int argc, char **ar
   /* SDL2 on Android lists the accelerometer as a joystick by default; the
    * host opens unmapped joysticks as controllers, so tilting the phone moved
    * the player and the menu cursors. Must precede SDL_Init. */
-  SDL_SetHint(SDL_HINT_ACCELEROMETER_AS_JOYSTICK, "0");
+  SDL_SetHintWithPriority(SDL_HINT_ACCELEROMETER_AS_JOYSTICK, "0", SDL_HINT_OVERRIDE);
   /* All relative I/O (config.ini, rom.cfg, saves/, last_run_report.json)
    * lands in the app's external files dir, which is adb-pushable. */
   {
@@ -5354,7 +5354,44 @@ static bool SeatHeldForOtherPad(int j, uint32 joystick_id) {
 #endif
 }
 
+/* Android exposes motion sensors as joysticks: SDL2's "Android Accelerometer"
+ * (when SDL_HINT_ACCELEROMETER_AS_JOYSTICK is not honoured early enough) and
+ * some phones' own sensor HID devices. Opened as a controller they turned
+ * phone tilt into d-pad input. A device with no buttons, or named after a
+ * sensor, is never a controller. */
+static bool HostJoystickIsSensor(int index) {
+#if defined(__ANDROID__)
+  const char *name = SDL_JoystickNameForIndex(index);
+  if (name) {
+    char lower[128];
+    size_t n = 0;
+    for (; name[n] && n + 1 < sizeof lower; ++n)
+      lower[n] = (char)((name[n] >= 'A' && name[n] <= 'Z') ? name[n] + 32 : name[n]);
+    lower[n] = 0;
+    if (strstr(lower, "accelerometer") || strstr(lower, "gyro") ||
+        strstr(lower, "sensor") || strstr(lower, "motion"))
+      return true;
+  }
+  if (!SDL_IsGameController(index)) {
+    SDL_Joystick *js = SDL_JoystickOpen(index);
+    if (js) {
+      const int buttons = SDL_JoystickNumButtons(js);
+      const int hats = SDL_JoystickNumHats(js);
+      SDL_JoystickClose(js);
+      if (buttons <= 0 && hats <= 0) return true;
+    }
+  }
+#else
+  (void)index;
+#endif
+  return false;
+}
+
 static void OpenOneGamepad(int i) {
+  if (HostJoystickIsSensor(i)) {
+    printf("[Gamepad] ignoring motion sensor joystick #%d\n", i);
+    return;
+  }
   if (!SDL_IsGameController(i)) {
     OpenOneJoystick(i);
     return;
@@ -5410,7 +5447,7 @@ static void OpenOneGamepad(int i) {
 }
 
 static void OpenOneJoystick(int i) {
-  if (SDL_IsGameController(i)) return;
+  if (SDL_IsGameController(i) || HostJoystickIsSensor(i)) return;
   SDL_Joystick *joystick = SDL_JoystickOpen(i);
   if (!joystick) {
     fprintf(stderr, "Could not open raw joystick %d: %s\n", i, SDL_GetError());
