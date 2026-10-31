@@ -1238,7 +1238,8 @@ function(snesrecomp_target_desktop_host target)
     target_sources(${target} PRIVATE
         ${SNESRECOMP_RUNNER_ROOT}/src/desktop/host_main.c
         ${SNESRECOMP_RUNNER_ROOT}/src/desktop/host_clock.c
-        ${SNESRECOMP_RUNNER_ROOT}/src/desktop/host_relaunch.c)
+        ${SNESRECOMP_RUNNER_ROOT}/src/desktop/host_relaunch.c
+        ${SNESRECOMP_RUNNER_ROOT}/src/desktop/touch_pad.c)
     target_include_directories(${target} PRIVATE
         ${SNESRECOMP_RUNNER_ROOT}/src/desktop)
     snesrecomp_target_mmx_config(${target})

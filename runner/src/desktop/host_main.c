@@ -180,6 +180,7 @@ void OpenGLRenderer_Create(struct RendererFuncs *funcs);
 /* Declarations only (no GL headers): the window-overlay quad type is shared
  * with the SDL_Renderer chat path, which Android uses too. */
 #include "opengl.h"   /* snesrecomp_opengl_set_vsync, SnesWindowOverlayQuad */
+#include "touch_pad.h"
 
 /* ── Symbols the framework leaves to the host ─────────────────────────────── */
 
@@ -1576,7 +1577,8 @@ static void DrawPpuFrameWithPerf(void) {
 /* Seat-0 input word the overlays navigate with — the same sources the guest
  * gets, minus the script (an overlay is a human facility). */
 static uint32 OverlayNavInputs(void) {
-  return g_input_state | g_pad_buttons | g_gamepad[0].axis_buttons;
+  return g_input_state | g_pad_buttons | g_gamepad[0].axis_buttons |
+         touch_pad_buttons();
 }
 
 /* Controller and joystick events, in ONE place, because the overlays' modal
@@ -1590,6 +1592,13 @@ static uint32 OverlayNavInputs(void) {
  * event was one of ours. */
 static bool HandleDeviceEvent(const SDL_Event *event) {
   GamepadInfo *gi;
+  /* On-screen controller: touch shows it, a physical pad hides it. */
+  if (touch_pad_handle_event(event))
+    return true;
+  if (event->type == SDL_CONTROLLERBUTTONDOWN ||
+      (event->type == SDL_CONTROLLERAXISMOTION &&
+       abs(SNESRECOMP_SDL_EVENT_AXIS_VALUE(*event)) > 16000))
+    touch_pad_note_other_input();
   switch (event->type) {
   case SDL_CONTROLLERDEVICEADDED:
     OpenOneGamepad(event->cdevice.which);
@@ -2672,6 +2681,11 @@ static void SdlRenderer_EndDraw(void) {
     SdlRenderer_DrawChat(output_w, output_h, &g_sdl_present_rect);
   }
 #endif
+  if (touch_pad_enabled()) {
+    int output_w = 0, output_h = 0;
+    SdlRenderer_GetOutputSize(&output_w, &output_h);
+    touch_pad_draw(g_renderer, output_w, output_h);
+  }
   SDL_RenderPresent(g_renderer);
 }
 
@@ -2966,7 +2980,7 @@ static uint16_t netplay_capture_pad(void *ctx) {
   const unsigned player = snes_netplay_input_player() == 1 ? 1 : 0;
   return (uint16_t)snes_savestate_menu_filter_guest_input(
       (((HostChatFilterKeyboard(g_input_state) | g_pad_buttons) >> (player * 12)) |
-       g_gamepad[player].axis_buttons) & 0x0fffu);
+       g_gamepad[player].axis_buttons | touch_pad_buttons()) & 0x0fffu);
 }
 
 static void netplay_poll_events(void *ctx, int *want_soft_exit) {
@@ -4287,6 +4301,7 @@ error_reading:;
   }
   g_window = window;
   SDL_SetWindowHitTest(window, HitTestCallback, NULL);
+  touch_pad_init();
   host_report_breadcrumb("window created: %dx%d flags=0x%x",
                          window_width, window_height, g_win_flags);
 
@@ -4508,6 +4523,7 @@ error_reading:;
         }
         break;
       case SDL_KEYDOWN:
+        touch_pad_note_other_input();   /* a keyboard player has no use for it */
 #if defined(SNES_HAS_LOBBY_CLIENT)
         if (g_netplay_session && snes_savestate_menu_is_open()) {
           snes_savestate_menu_handle_key(SNESRECOMP_SDL_EVENT_KEY(event),
