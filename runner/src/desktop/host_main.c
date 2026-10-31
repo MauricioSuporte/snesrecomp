@@ -2148,6 +2148,25 @@ static uint64_t g_audio_callback_count;  /* protected by g_audio_mutex */
 static bool g_audio_primed;  /* protected by g_audio_mutex */
 #define HOST_AUDIO_PREFILL 2136u
 #define HOST_AUDIO_HIGH_WATER 4096u
+/* A device that pulls in large, irregular chunks (WSLg's RDP sink asks for
+ * ~1000 frames at a time) empties a 2136-frame cushion and the ring runs dry
+ * every few seconds: each time the output is silent until it refills, heard
+ * as crackling. The cushion grows by one guest frame of sound after each dry
+ * spell (and is never smaller than the largest request plus one frame), and
+ * the producer's high water follows it. Both protected by g_audio_mutex. */
+#define HOST_AUDIO_PREFILL_MAX 4608u
+static uint32_t g_audio_prefill = HOST_AUDIO_PREFILL;
+static uint32_t g_audio_high_water = HOST_AUDIO_HIGH_WATER;
+static uint32_t g_audio_request_max;
+static void AudioRaiseCushion(uint32_t frames) {
+  uint32_t prefill = frames > HOST_AUDIO_PREFILL_MAX ? HOST_AUDIO_PREFILL_MAX : frames;
+  if (prefill <= g_audio_prefill) return;
+  g_audio_prefill = prefill;
+  g_audio_high_water = g_audio_prefill + 2048u > HOST_AUDIO_HIGH_WATER
+      ? g_audio_prefill + 2048u : HOST_AUDIO_HIGH_WATER;
+  host_report_breadcrumb("audio: cushion raised to %u frames (largest device request %u)",
+                         g_audio_prefill, g_audio_request_max);
+}
 #if SNESRECOMP_SDL3
 /* SDL3 replaced the pull callback with an SDL_AudioStream the app pushes into,
  * so the mixer needs a scratch buffer sized to whatever the stream asks for. */
@@ -2181,12 +2200,12 @@ void RtlApuUnlock(void) {
     g_audio_consumer_stalled = false;
   if (g_apu_lock_depth == 0 && g_audio_producer_active &&
       !g_audio_consumer_stalled &&
-      dsp_available(g_snes->apu->dsp) > HOST_AUDIO_HIGH_WATER) {
+      dsp_available(g_snes->apu->dsp) > g_audio_high_water) {
     /* Fast hosts can generate a multi-frame loader's PCM in milliseconds.
      * Let the device drain it before the bounded ring overflows. Always
      * release the mutex while waiting, and stop waiting if the device stalls. */
     double limit = MonotonicSeconds() + 0.25;
-    while (dsp_available(g_snes->apu->dsp) > HOST_AUDIO_HIGH_WATER) {
+    while (dsp_available(g_snes->apu->dsp) > g_audio_high_water) {
       SDL_UnlockMutex(g_audio_mutex);
       SDL_Delay(1);
       SDL_LockMutex(g_audio_mutex);
@@ -2213,10 +2232,17 @@ static void FillAudioBuffer(Uint8 *stream, int len) {
     host_report_breadcrumb("first audio callback (len=%d)", len);
   if (!snesrecomp_sdl_lock_mutex(g_audio_mutex)) Die("Mutex lock failed!");
   ++g_audio_callback_count;
+  {
+    uint32_t request = (uint32_t)len / (uint32_t)(g_audio_channels * sizeof(int16));
+    if (request > g_audio_request_max) {
+      g_audio_request_max = request;
+      AudioRaiseCushion(request + (uint32_t)g_frames_per_block);
+    }
+  }
   while (len != 0) {
     if (g_audiobuffer_end - g_audiobuffer_cur == 0) {
       uint32_t available = dsp_available(g_snes->apu->dsp);
-      if (!g_audio_primed && available < HOST_AUDIO_PREFILL) {
+      if (!g_audio_primed && available < g_audio_prefill) {
         /* Startup/save-load starvation needs a cushion before playback
          * resumes. Retain all native PCM; count the undelivered output just
          * like any other underrun rather than hiding it from diagnostics. */
@@ -2226,8 +2252,10 @@ static void FillAudioBuffer(Uint8 *stream, int len) {
       } else {
         g_audio_primed = true;
         RtlRenderAudio((int16 *)g_audiobuffer, g_frames_per_block, g_audio_channels);
-        if (dsp_available(g_snes->apu->dsp) < 4)
+        if (dsp_available(g_snes->apu->dsp) < 4) {
           g_audio_primed = false;
+          AudioRaiseCushion(g_audio_prefill + (uint32_t)g_frames_per_block);
+        }
       }
       g_audiobuffer_cur = g_audiobuffer;
       g_audiobuffer_end = g_audiobuffer + g_frames_per_block * g_audio_channels * sizeof(int16);
