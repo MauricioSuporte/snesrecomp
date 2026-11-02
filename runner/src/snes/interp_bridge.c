@@ -1598,7 +1598,7 @@ typedef struct QuiescentState {
  * repeated often enough that the run must yield; the caller then performs
  * the yield. Shared by the main loop and the wait-loop shortcut so both run
  * the identical detector. */
-static inline int interp_quiescent_step(QuiescentState *qring, const Interp816 *in,
+static inline __attribute__((always_inline)) int interp_quiescent_step(QuiescentState *qring, const Interp816 *in,
                                         uint32_t pc_before, long steps) {
     QuiescentState now;
     memset(&now, 0, sizeof now);
