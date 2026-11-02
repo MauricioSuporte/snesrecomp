@@ -134,6 +134,17 @@ void snes_sync_master_clock(Snes *snes, uint64_t master_clock) {
 void cart_sync_coprocessors(Cart *cart, uint64_t master_clock) {
     (void)cart; (void)master_clock;
 }
+/* The flat 16 MiB RAM models the bus the way the console maps WRAM: every
+ * WRAM address ($7E/$7F and the low-8 KiB mirror in the system banks) lands
+ * on one copy at $7E0000 + offset, which is also CpuState.ram (WRAM). The
+ * bridge's plain-cart fast read indexes CpuState.ram directly, so a test bus
+ * that kept the mirrors apart would disagree with it. */
+#define WRAM (RAM + 0x7E0000)
+static uint32 flat_index(uint32 a24) {
+    a24 &= 0xFFFFFF;
+    const int32_t off = cpu_wram_offset((uint8)(a24 >> 16), (uint16)a24);
+    return off >= 0 ? 0x7E0000u + (uint32)off : a24;
+}
 /* A plain LoROM cart over the flat RAM: $8000-$FFFF of every non-WRAM bank is
  * ROM. The stable-poll detector asks the cart which reads are ROM. */
 static Cart g_test_cart;
@@ -146,7 +157,7 @@ uint8_t *cart_getRomPtr(Cart *cart, uint8_t bank, uint16_t adr) {
  * step-ring dump into this hook, so provide the slot. */
 void (*g_interp_recent_dump_hook)(int n, FILE *out) = 0;
 uint8 cpu_read8(CpuState *cpu, uint8 bank, uint16 addr) {
-    (void)cpu; return RAM[(((uint32)bank << 16) | addr) & 0xFFFFFF];
+    (void)cpu; return RAM[flat_index(((uint32)bank << 16) | addr)];
 }
 /* Write-site attribution probe (S16): what the bridge published as the
  * executing opcode's PC when this store reached the bus. */
@@ -154,7 +165,7 @@ extern uint32_t g_interp_wlog_pc24;
 static uint32_t g_write_site_pc24 = 0xFFFFFFFFu;
 static uint32_t g_aot_saw_site_pc24 = 0xFFFFFFFFu;
 void cpu_write8(CpuState *cpu, uint8 bank, uint16 addr, uint8 v) {
-    (void)cpu; RAM[(((uint32)bank << 16) | addr) & 0xFFFFFF] = v;
+    (void)cpu; RAM[flat_index(((uint32)bank << 16) | addr)] = v;
     if (bank == 0 && addr == 0x0420) g_write_site_pc24 = g_interp_wlog_pc24;
 }
 uint16 cpu_read16(CpuState *cpu, uint8 bank, uint16 addr) {
@@ -388,10 +399,10 @@ static int g_fail = 0, g_check = 0;
 static void init_cpu(void) {
     memset(&g_c, 0, sizeof g_c);
     g_c.S = 0x01FF; g_c.emulation = 1; g_c.m_flag = 1; g_c.x_flag = 1;
-    g_c._flag_I = 1; g_c.ram = RAM; cpu_mirrors_to_p(&g_c);
+    g_c._flag_I = 1; g_c.ram = WRAM; cpu_mirrors_to_p(&g_c);
 }
 static void load(uint32 pc24, const uint8_t *code, int len) {
-    memcpy(&RAM[pc24 & 0xFFFFFF], code, (size_t)len);
+    for (int i = 0; i < len; ++i) RAM[flat_index(pc24 + (uint32)i)] = code[i];
 }
 
 static unsigned hook_order,hook_a,hook_b,hook_c,hook_dest;
@@ -431,7 +442,7 @@ static uint8_t g_poll_answer_value;
 static void poll_device(CpuState *cpu, uint32_t pc) {
     (void)cpu; (void)pc;
     if (++g_poll_visits == 10)
-        RAM[g_poll_answer_addr & 0xFFFFFF] = g_poll_answer_value;
+        RAM[flat_index(g_poll_answer_addr)] = g_poll_answer_value;
 }
 /* Run `code` at $8000 as a cooperative-scheduler task whose RTS lands in the
  * scheduler's own wait at $8100 (LDA $20; BNE self, flag value 0). */
@@ -710,7 +721,7 @@ int main(void) {
           0x80,0xF8                          /*        BRA $8010 */
       };
       load(0x8000, c, sizeof c); load(0x8010, caller, sizeof caller);
-      RAM[0x10] = 0x34;
+      WRAM[0x10] = 0x34;
       int rc1 = interp_bridge_run_loop(&g_c, 0x008010, 0x008003, 0x0030, 0xFF);
       printf("S7 interrupt-owned stable-value poll yields and resumes\n");
       CHECK(rc1 == 1, "first rc=%d exp 1 (clean cooperative yield)", rc1);
@@ -719,11 +730,11 @@ int main(void) {
       CHECK(interp_bridge_lle_resume_pc() == 0x008003,
             "resume=$%06X exp $008003 (CMP)",
             (unsigned)interp_bridge_lle_resume_pc());
-      RAM[0x10] = 0x35;                      /* models the next frame's NMI */
+      WRAM[0x10] = 0x35;                      /* models the next frame's NMI */
       int rc2 = interp_bridge_run_loop(&g_c, interp_bridge_lle_resume_pc(),
                                        0x008003, 0x0030, 0xFF);
       CHECK(rc2 == 1, "second rc=%d exp 1 (yields on the next sample)", rc2);
-      CHECK(RAM[0x20] == 0x34, "caller saw $%02X exp 34 (poll exited with its sample)", RAM[0x20]);
+      CHECK(WRAM[0x20] == 0x34, "caller saw $%02X exp 34 (poll exited with its sample)", WRAM[0x20]);
       CHECK((g_c.A & 0xFF) == 0x35, "A.lo=%02X exp 35 (new sample)", g_c.A & 0xFF);
       CHECK(g_c.S == 0x01FD, "S=%04X exp 01FD (one frame, balanced)", g_c.S);
       CHECK(interp_bridge_lle_resume_pc() == 0x008003,
@@ -760,7 +771,7 @@ int main(void) {
       };
       load(0x8000, caller, sizeof caller);
       load(0x8200, continuation, sizeof continuation);
-      RAM[0x20] = 0;
+      WRAM[0x20] = 0;
       int rc = interp_bridge_run_loop(&g_c, 0x008000, 0x008202, 0x0020, 0);
       printf("S8 LLE bounce resumes a rewritten return in its interpreter\n");
       CHECK(rc == 1, "rc=%d exp 1", rc);
@@ -803,10 +814,10 @@ int main(void) {
       load(0x8000, caller, sizeof caller);
       load(0x8200, continuation, sizeof continuation);
       load(0x8300, wait_epilogue, sizeof wait_epilogue);
-      RAM[0x20] = 0;
+      WRAM[0x20] = 0;
       /* The previous frame yielded inside $8300's callee frame: JSR $8300's
        * return address ($8002) is on the stack and S is below the caller. */
-      RAM[0x1FF] = 0x80; RAM[0x1FE] = 0x02; g_c.S = 0x01FD;
+      WRAM[0x1FF] = 0x80; WRAM[0x1FE] = 0x02; g_c.S = 0x01FD;
       int rc = interp_bridge_run_loop(&g_c, 0x008300, 0x008202, 0x0020, 0);
       printf("S8d scheduler frame resumed below its caller keeps a rewritten return\n");
       CHECK(rc == 1, "rc=%d exp 1 (frame yields, not bail)", rc);
@@ -849,7 +860,7 @@ int main(void) {
       };
       load(0x8000, scheduler, sizeof scheduler);
       load(0x8300, gap_routine, sizeof gap_routine);
-      RAM[0x20] = 0;
+      WRAM[0x20] = 0;
       int rc = interp_bridge_run_loop(&g_c, 0x008000, 0x008006, 0x0020, 0);
       printf("S8e nested gap frame hands the scheduler's wait outward\n");
       CHECK(rc == 1, "rc=%d exp 1 (frame yields, not bail)", rc);
@@ -887,20 +898,20 @@ int main(void) {
       if (wide) gap[1] = 0xC2;                /* REP #$20 */
       load(0x8000, scheduler, sizeof scheduler);
       load(0x8300, gap, sizeof gap);
-      RAM[0x10] = 0x34; RAM[0x11] = 0x12;
+      WRAM[0x10] = 0x34; WRAM[0x11] = 0x12;
       const uint8_t original_p = g_c.P;
       int rc = interp_bridge_run_loop(&g_c, 0x008000, 0x008008, 0x20, 0);
       printf("S8f nested %d-bit counter wait preserves guest continuation\n", wide ? 16 : 8);
       CHECK(rc == 1 && !g_abandon_called, "counter wait must yield without abandon");
       CHECK(interp_bridge_lle_resume_pc() == 0x008306,
             "resume=$%06X exp $008306", (unsigned)interp_bridge_lle_resume_pc());
-      CHECK(g_c.S == 0x01FB && RAM[0x21] == 0,
+      CHECK(g_c.S == 0x01FB && WRAM[0x21] == 0,
             "guest JSL/PHP retained, caller not yet executed: S=%04X", g_c.S);
-      CHECK(RAM[0x01FC] == original_p, "PHP must retain original status");
-      RAM[wide ? 0x11 : 0x10]++;              /* asynchronous counter change */
+      CHECK(WRAM[0x01FC] == original_p, "PHP must retain original status");
+      WRAM[wide ? 0x11 : 0x10]++;              /* asynchronous counter change */
       rc = interp_bridge_run_loop(&g_c, interp_bridge_lle_resume_pc(),
                                    0x008008, 0x20, 0);
-      CHECK(rc == 1 && g_c.S == 0x01FF && RAM[0x21] == 0x5A,
+      CHECK(rc == 1 && g_c.S == 0x01FF && WRAM[0x21] == 0x5A,
             "counter change must resume real PLP/RTL and caller: S=%04X", g_c.S);
       CHECK((g_c.P & 0x30) == (original_p & 0x30), "PLP restores widths");
       CHECK(g_aot_called == 1 && g_abandon_called == 0,
@@ -921,7 +932,7 @@ int main(void) {
           0xAD,0x20,0x00, 0xD0,0xFB            /* cooperative wait loop */
       };
       load(0x8000, scheduler, sizeof scheduler);
-      RAM[0x20] = 0;
+      WRAM[0x20] = 0;
       int rc = interp_bridge_run_loop(&g_c, 0x008000, 0x008006, 0x0020, 0);
       printf("S8b scheduler consumes AOT-root SKIP_1\n");
       CHECK(rc == 1, "rc=%d exp 1", rc);
@@ -944,7 +955,7 @@ int main(void) {
           0xAD,0x20,0x00, 0xD0,0xFB            /* cooperative wait loop */
       };
       load(0x8000, scheduler, sizeof scheduler);
-      RAM[0x20] = 0;
+      WRAM[0x20] = 0;
       int rc = interp_bridge_run_loop(&g_c, 0x008000, 0x008006, 0x0020, 0);
       printf("S8c scheduler deadline unwind returns to host\n");
       CHECK(rc == 1, "rc=%d exp 1", rc);
@@ -997,7 +1008,7 @@ int main(void) {
       uint8_t parent_epilogue[] = {0xAB,0x28,0x6B}; /* PLB; PLP; RTL */
       load(0x8000, caller, sizeof caller);
       load(0x8200, parent_epilogue, sizeof parent_epilogue);
-      RAM[0x20] = 0;
+      WRAM[0x20] = 0;
       int rc = interp_bridge_run_loop(&g_c, 0x008000, 0x008004, 0x0020, 0);
       printf("S9 nested AOT rewritten return resumes compiled ancestor\n");
       CHECK(rc == 1, "rc=%d exp 1", rc);
@@ -1139,7 +1150,7 @@ int main(void) {
       uint8_t jump[] = {0xDC,0x00,0x10}; /* JML [$1000] */
       uint8_t body[] = {0xA9,0x07,0x60}; /* LDA #7 ; RTS */
       load(0xA69000, jump, sizeof jump); load(0xA69100, body, sizeof body);
-      RAM[0x1000] = 0x00; RAM[0x1001] = 0x91; RAM[0x1002] = 0xA6;
+      WRAM[0x1000] = 0x00; WRAM[0x1001] = 0x91; WRAM[0x1002] = 0xA6;
       cpu_push_jsr_return_frame(&g_c);
       RecompReturn r = tail
           ? interp_tier_dispatch_tail_ex(&g_c, 0xA69000, 0x269000, g_c.S, 2, true)
@@ -1224,7 +1235,7 @@ int main(void) {
       s15c_step=0;s15c_n=0;s15c_log[0]=0;
       uint8_t a[]={0x5c,0xfe,0xff,0x7f};          /* $00:8000 JML $7F:FFFE */
       load(0x008000,a,sizeof a);
-      RAM[0x7ffffe]=0xea; RAM[0x7fffff]=0xea;      /* NOP, NOP -> wraps to $7F:0000 */
+      WRAM[0x1fffe]=0xea; WRAM[0x1ffff]=0xea;      /* NOP, NOP -> wraps to $7F:0000 */
       uint8_t b[]={0x5c,0xfe,0xff,0x00};          /* $7F:0000 JML $00:FFFE */
       load(0x7f0000,b,sizeof b);
       RAM[0x00fffe]=0xea; RAM[0x00ffff]=0xea;      /* NOP, NOP -> wraps to $00:0000 */
@@ -1362,7 +1373,7 @@ int main(void) {
       load(0x8000, scheduler, sizeof scheduler);
       if (wide) load(0x8300, gap16, sizeof gap16);
       else load(0x8300, gap, sizeof gap);
-      RAM[0x10] = 0x01;
+      WRAM[0x10] = 0x01;
       const uint64_t r0 = interp_bridge_resume_total();
       int rc = interp_bridge_run_loop(&g_c, 0x008000, 0x008008, 0x20, 0);
       printf("S17a nested %d-bit LDA/AND/BNE wait hands outward\n", wide ? 16 : 8);
@@ -1373,11 +1384,11 @@ int main(void) {
       CHECK(resume_ring_has(r0, INTERP_RESUME_SITE_STABLE_POLL,
                             INTERP_RESUME_KIND_UNWIND_ARM),
             "nested frame must hand the wait outward (stable_poll unwind_arm)");
-      CHECK(g_c.S == 0x01FB && RAM[0x21] == 0, "frames retained, caller not run");
-      RAM[0x10] = 0x00;                        /* interrupt clears the flag */
+      CHECK(g_c.S == 0x01FB && WRAM[0x21] == 0, "frames retained, caller not run");
+      WRAM[0x10] = 0x00;                        /* interrupt clears the flag */
       rc = interp_bridge_run_loop(&g_c, interp_bridge_lle_resume_pc(),
                                   0x008008, 0x20, 0);
-      CHECK(rc == 1 && g_c.S == 0x01FF && RAM[0x21] == 0x5A,
+      CHECK(rc == 1 && g_c.S == 0x01FF && WRAM[0x21] == 0x5A,
             "release resumes PLP/RTL and the caller once: S=%04X", g_c.S);
       CHECK(g_aot_called == 1 && g_abandon_called == 0,
             "nested body not re-entered or abandoned");
@@ -1386,13 +1397,13 @@ int main(void) {
     /* (b) scheduler frame, long-indexed WRAM read: LDX; LDA long,X; BMI */
     { memset(RAM, 0, MEMSZ); init_cpu();
       const uint8_t c[] = {0xA2,0x02, 0xBF,0x0E,0x00,0x7E, 0x30,0xFA, 0x60};
-      RAM[0x7E0010] = 0x80;
+      WRAM[0x0010] = 0x80;
       int rc = run_poll_task(c, sizeof c);
       printf("S17b long-indexed WRAM wait yields at its head\n");
       CHECK(rc == 1 && interp_bridge_lle_resume_pc() == 0x008002,
             "rc=%d resume=$%06X exp $008002", rc,
             (unsigned)interp_bridge_lle_resume_pc());
-      RAM[0x7E0010] = 0x00;
+      WRAM[0x0010] = 0x00;
       rc = interp_bridge_run_loop(&g_c, interp_bridge_lle_resume_pc(),
                                   0x008100, 0x0020, 0);
       CHECK(rc == 1 && interp_bridge_lle_resume_pc() == 0x008100,
