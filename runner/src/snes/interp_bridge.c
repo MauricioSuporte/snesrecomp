@@ -1554,6 +1554,84 @@ static void interp_hist_init(void) {
 }
 #endif
 
+#ifndef SNESRECOMP_INTERP_WAIT_FASTPATH
+#if defined(SNESRECOMP_INTERP_PROFILE) || defined(SNES_COSIM)
+#define SNESRECOMP_INTERP_WAIT_FASTPATH 0   /* these observe every step */
+#else
+#define SNESRECOMP_INTERP_WAIT_FASTPATH 1
+#endif
+#endif
+#if SNESRECOMP_INTERP_WAIT_FASTPATH
+static uint64_t s_wait_fp_insns;
+uint64_t interp_bridge_wait_fastpath_insns(void) { return s_wait_fp_insns; }
+/* PCs the step loop specializes by address (Star Ocean work/vblank waits):
+ * the shortcut never runs over them. */
+static int interp_wait_fp_special_pc(uint32_t pc) {
+    switch (pc & 0xFFFFFFu) {
+    case 0xC084B2u: case 0xC084B4u:
+    case 0xC0849Eu: case 0xC084A1u: case 0xC084A3u: case 0xC084A6u:
+    case 0xC20B51u: case 0xC20B57u: case 0xC20B82u: case 0xC20B87u:
+    case 0xC2DB39u: case 0xC2DB3Eu: case 0xC618D1u: case 0xC618D6u:
+    case 0xC8F40Fu: case 0xC8F414u: case 0xC8F425u: case 0xC8F42Au:
+    case 0xCA6D13u: case 0xCA6D18u: case 0xCC0538u: case 0xCC053Du:
+    case 0xCC054Eu: case 0xCC0553u:
+        return 1;
+    default:
+        return 0;
+    }
+}
+#endif
+
+typedef struct QuiescentState {
+    uint32_t pc;
+    uint16_t a, x, y, sp, dp;
+    uint8_t db, k, c, z, v, n, i, d, mf, xf, e;
+    uint64_t write_epoch;
+    uint64_t continuous_read_epoch;
+    long step;
+    unsigned repeats;
+} QuiescentState;
+
+/* The auto-quiescent detector for one interpreted step: compares the state
+ * before the opcode at pc_before with the ring (see the comments at the
+ * call site in _interp_run_core) and records it. Returns 1 when the state has
+ * repeated often enough that the run must yield; the caller then performs
+ * the yield. Shared by the main loop and the wait-loop shortcut so both run
+ * the identical detector. */
+static inline int interp_quiescent_step(QuiescentState *qring, const Interp816 *in,
+                                        uint32_t pc_before, long steps) {
+    QuiescentState now;
+    memset(&now, 0, sizeof now);
+    now.pc=pc_before; now.a=in->a; now.x=in->x; now.y=in->y;
+    now.sp=in->sp; now.dp=in->dp; now.db=in->db; now.k=in->k;
+    now.c=in->c; now.z=in->z; now.v=in->v; now.n=in->n; now.i=in->i;
+    now.d=in->d; now.mf=in->mf; now.xf=in->xf; now.e=in->e;
+    now.write_epoch=g_interp_bridge_write_epoch; now.step=steps;
+    now.continuous_read_epoch=s_interp_continuous_read_epoch;
+    for (unsigned qi=0; qi<64; qi++) {
+        QuiescentState *old=&qring[qi];
+        if (old->step && steps-old->step<=256 &&
+            old->pc==now.pc && old->a==now.a && old->x==now.x &&
+            old->y==now.y && old->sp==now.sp && old->dp==now.dp &&
+            old->db==now.db && old->k==now.k && old->c==now.c &&
+            old->z==now.z && old->v==now.v && old->n==now.n &&
+            old->i==now.i && old->d==now.d && old->mf==now.mf &&
+            old->xf==now.xf && old->e==now.e &&
+            old->write_epoch==now.write_epoch &&
+            old->continuous_read_epoch==now.continuous_read_epoch) {
+            now.repeats=old->repeats+1;
+            if (now.repeats>=2) {
+                /* Stable CPU/memory state is a genuine cooperative
+                 * wait (see the caller): the caller yields. */
+                return 1;
+            }
+            break;
+        }
+    }
+    qring[steps & 63]=now;
+    return 0;
+}
+
 static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
                                  uint16_t s_exit, uint32_t *out_landing,
                                  uint32_t *out_return_pc,
@@ -1624,15 +1702,6 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
     uint8_t edge_op = 0;
     interp_edge_note(0, entry_pc24, INTERP_EDGE_ENTRY, 0, (uint16_t)cpu->S);
 
-    typedef struct QuiescentState {
-        uint32_t pc;
-        uint16_t a, x, y, sp, dp;
-        uint8_t db, k, c, z, v, n, i, d, mf, xf, e;
-        uint64_t write_epoch;
-        uint64_t continuous_read_epoch;
-        long step;
-        unsigned repeats;
-    } QuiescentState;
     QuiescentState qring[64];
     memset(qring, 0, sizeof qring);
     /* Stable-poll detector state: the architectural state at the last few
@@ -1670,6 +1739,22 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
         const char *_e = getenv("SNESRECOMP_NO_POLLGATE");
         s_poll_gate = (_e && _e[0] && _e[0] != '0') ? 0 : 1;
     }
+#if SNESRECOMP_INTERP_WAIT_FASTPATH
+    /* Wait-loop shortcut (see the block after the pre-opcode hooks below):
+     * only in an auto-quiescent run with every diagnostic that observes
+     * individual interpreted steps switched off. */
+    static int s_wait_fp_env = -1;
+    if (s_wait_fp_env < 0) {
+        const char *_e = getenv("SNESRECOMP_WAIT_FASTPATH");
+        s_wait_fp_env = !(_e && _e[0] == '0') &&
+            !getenv("SNESRECOMP_XCE_TRACE") && !getenv("SNESRECOMP_C2WATCH") &&
+            !getenv("SNESRECOMP_TRAP_BADPB") && !getenv("SNESRECOMP_CYC_WATCH") &&
+            !getenv("SNESRECOMP_PHASE_MS") && !getenv("SNESRECOMP_INTERP_OPCODE_HIST") &&
+            !getenv("SNESRECOMP_INTERP_PCTRACE");
+    }
+    const int wait_fp_ok = s_wait_fp_env && auto_quiescent && !trace && !dtrace &&
+                           !wlog_state_sync && n_stop == 0;
+#endif
     for (; steps < step_cap; steps++) {
         const uint32_t pc_before = ((uint32_t)in.k << 16) | in.pc;
 #ifdef SNESRECOMP_INTERP_PROFILE
@@ -2007,53 +2092,28 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
                 }
             }
         }
-        if (auto_quiescent) {
-            QuiescentState now;
-            memset(&now, 0, sizeof now);
-            now.pc=pc_before; now.a=in.a; now.x=in.x; now.y=in.y;
-            now.sp=in.sp; now.dp=in.dp; now.db=in.db; now.k=in.k;
-            now.c=in.c; now.z=in.z; now.v=in.v; now.n=in.n; now.i=in.i;
-            now.d=in.d; now.mf=in.mf; now.xf=in.xf; now.e=in.e;
-            now.write_epoch=g_interp_bridge_write_epoch; now.step=steps;
-            now.continuous_read_epoch=s_interp_continuous_read_epoch;
-            for (unsigned qi=0; qi<64; qi++) {
-                QuiescentState *old=&qring[qi];
-                if (old->step && steps-old->step<=256 &&
-                    old->pc==now.pc && old->a==now.a && old->x==now.x &&
-                    old->y==now.y && old->sp==now.sp && old->dp==now.dp &&
-                    old->db==now.db && old->k==now.k && old->c==now.c &&
-                    old->z==now.z && old->v==now.v && old->n==now.n &&
-                    old->i==now.i && old->d==now.d && old->mf==now.mf &&
-                    old->xf==now.xf && old->e==now.e &&
-                    old->write_epoch==now.write_epoch &&
-                    old->continuous_read_epoch==now.continuous_read_epoch) {
-                    now.repeats=old->repeats+1;
-                    if (now.repeats>=2) {
-                        /* Stable CPU/memory state is a genuine cooperative
-                         * wait.  The owning scheduler advances idle hardware
-                         * to the next timer comparator or vblank and resumes
-                         * here after servicing that event.  Burning the poll
-                         * inside the interpreter until any enabled timer fired
-                         * made a single host frame consume many guest frames
-                         * and could starve rendering.  Live MMIO polls are not
-                         * mistaken for this path: continuous_read_epoch changes
-                         * on every such read. */
-                        lle_resume_set(pc_before,
-                                       INTERP_RESUME_SITE_QUIESCENT, in.sp);
-                        s_lle_quiescent_yield = 1;
-                        /* Flush accumulated SPC time BEFORE yielding so the
-                         * SPC700 processes any pending port writes (Star Ocean
-                         * boot handshake: CPU writes to $2140-$2143 and polls
-                         * $2140 for response; without this flush the SPC stays
-                         * frozen and the game hangs at $C8F425). */
-                        bridge_apu_flush(cpu);
-                        sync_interp_to_cpu(&in,cpu);
-                        return 1;
-                    }
-                    break;
-                }
-            }
-            qring[steps & 63]=now;
+        if (auto_quiescent &&
+            interp_quiescent_step(qring, &in, pc_before, steps)) {
+            /* Stable CPU/memory state is a genuine cooperative
+             * wait.  The owning scheduler advances idle hardware
+             * to the next timer comparator or vblank and resumes
+             * here after servicing that event.  Burning the poll
+             * inside the interpreter until any enabled timer fired
+             * made a single host frame consume many guest frames
+             * and could starve rendering.  Live MMIO polls are not
+             * mistaken for this path: continuous_read_epoch changes
+             * on every such read. */
+            lle_resume_set(pc_before,
+                           INTERP_RESUME_SITE_QUIESCENT, in.sp);
+            s_lle_quiescent_yield = 1;
+            /* Flush accumulated SPC time BEFORE yielding so the
+             * SPC700 processes any pending port writes (Star Ocean
+             * boot handshake: CPU writes to $2140-$2143 and polls
+             * $2140 for response; without this flush the SPC stays
+             * frozen and the game hangs at $C8F425). */
+            bridge_apu_flush(cpu);
+            sync_interp_to_cpu(&in,cpu);
+            return 1;
         }
         if (s_pre_opcode_hook_count > 0 &&
             pre_opcode_bit_test(pc_before & 0x7FFFFFu)) {
@@ -2081,6 +2141,220 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
              * another, and could miss a terminal RTS. */
             if (redirected) continue;
         }
+#if SNESRECOMP_INTERP_WAIT_FASTPATH
+        /* Wait-loop shortcut. A two-instruction loop that re-reads one direct-
+         * page byte until it changes --
+         *
+         *     P:   CMP dp   |  LDA dp
+         *     P+2: Bcc P    (BEQ/BNE/BPL/BMI/BVC/BVS/BCC/BCS, offset -4)
+         *
+         * (Super Bomberman 5's NMI wait at $80:F498 runs ~5,500 times a frame,
+         * two thirds of all interpreted instructions) -- is recognised from
+         * its bytes, no game address is involved. Its iterations run here in
+         * a tight loop that performs, for each instruction, the same steps as
+         * this loop body, in the same order: the IRQ/deadline/step-cap checks,
+         * the quiescent detector, the pre-opcode hook bitmap, the opcode peek,
+         * the step rings, the PC hook, the opcode itself through the bus
+         * callbacks (bus timing, epochs, open bus and the cart bus latch are
+         * those of bridge_bus_read), the cycle accounting, refresh, beam and
+         * coprocessor sync, APU batching and the progress epochs. Only the
+         * per-step tests that cannot apply to these two opcodes are skipped.
+         * Any check that wants the general path hands the instruction back
+         * BEFORE its quiescent step, so the loop below repeats exactly the
+         * checks this shortcut made. SNESRECOMP_WAIT_FASTPATH=0 disables it. */
+        if (wait_fp_ok && !in.e && !in.stopped && !in.waiting &&
+            !in.nmiWanted && !in.irqWanted && !g_tier2_capture_active &&
+            g_snes && g_snes->cart &&
+            (g_snes->cart->type == CART_HIROM || g_snes->cart->type == CART_LOROM) &&
+            (uint16_t)pc_before <= 0xFFFCu) {
+            const uint8_t *wb = cart_getRomPtr(g_snes->cart, in.k, in.pc);
+            const uint8_t *wb3 = cart_getRomPtr(g_snes->cart, in.k, (uint16_t)(in.pc + 3));
+            const uint8_t w0 = wb ? wb[0] : 0, w2 = wb ? wb[2] : 0;
+            if (wb && wb3 == wb + 3 && (w0 == 0xC5 || w0 == 0xA5) && wb[3] == 0xFC &&
+                (w2 == 0xF0 || w2 == 0xD0 || w2 == 0x10 || w2 == 0x30 ||
+                 w2 == 0x50 || w2 == 0x70 || w2 == 0x90 || w2 == 0xB0) &&
+                !interp_wait_fp_special_pc(pc_before) &&
+                !interp_wait_fp_special_pc(pc_before + 2)) {
+                const uint32_t wp = pc_before;
+                const uint8_t w1 = wb[1], w3 = wb[3];
+                int first = 1;
+                for (;;) {
+                    const uint32_t ipc = ((uint32_t)in.k << 16) | in.pc;
+                    const int at_read = ipc == wp;
+                    if (!first) {
+                        /* Whether ipc is still a step of this loop. These tests
+                         * have no side effects; when one fails the loop above
+                         * receives the instruction with nothing done for it. */
+                        if (!at_read && ipc != wp + 2) break;           /* loop left */
+                        if (at_read ? (wb[0] != w0 || wb[1] != w1)
+                                    : (wb[2] != w2 || wb[3] != w3)) break; /* bytes changed */
+                        if (s_pre_opcode_hook_count > 0 &&
+                            pre_opcode_bit_test(ipc & 0x7FFFFFu)) break;  /* hooked PC */
+                        if (g_tier2_capture_active || s_interp_pctrace) break;
+                        if (steps >= step_cap) break;
+                        /* The loop's per-step work for ipc, in its order. */
+#if SNESRECOMP_REVERSE_DEBUG
+                        sync_interp_to_cpu(&in, cpu);
+                        debug_on_block_enter(ipc, in.a, in.x, in.y);
+                        sync_cpu_to_interp(cpu, &in);
+#endif
+                        if (steps && !in.i &&
+                            (g_snes->inIrq ||
+                             (g_snes->cart->superfx && g_snes->cart->superfx->irq_pending) ||
+                             (g_snes->cart->cx4 && cx4_irq_pending(g_snes->cart->cx4)) ||
+                             (g_snes->cart->sa1 && sa1_cpu_irq_pending(g_snes->cart->sa1)))) {
+                            lle_resume_set(ipc, INTERP_RESUME_SITE_IRQ_PENDING, in.sp);
+                            sync_interp_to_cpu(&in,cpu);
+                            bridge_apu_flush(cpu);
+                            return 1;
+                        }
+                        if (s_lle_master_deadline &&
+                            cpu->master_cycles >= s_lle_master_deadline) {
+                            lle_resume_set(ipc, INTERP_RESUME_SITE_DEADLINE, in.sp);
+                            sync_interp_to_cpu(&in,cpu);
+                            bridge_apu_flush(cpu);
+                            return 1;
+                        }
+                        if (interp_quiescent_step(qring, &in, ipc, steps)) {
+                            lle_resume_set(ipc, INTERP_RESUME_SITE_QUIESCENT, in.sp);
+                            s_lle_quiescent_yield = 1;
+                            bridge_apu_flush(cpu);
+                            sync_interp_to_cpu(&in,cpu);
+                            return 1;
+                        }
+                    }
+                    first = 0;
+                    /* Opcode peek, step rings and edge notes (as above). */
+                    const uint8_t op = bridge_bus_read(cpu, ipc);
+                    {
+                        ITraceEnt _e = { ipc, op };
+                        if (itn < 8) head[itn] = _e;
+                        itn++;
+                        ITraceRecentEnt *_g =
+                            &g_itrace_recent[g_itrace_recent_n++ & (ITRACE_RECENT_LEN - 1)];
+                        _g->pc = ipc; _g->frame = snes_frame_counter;
+                        _g->sp = in.sp; _g->op = op; _g->pad = 0;
+                        if ((ipc & 0xFFFFFFu) != edge_expect && itn > 1)
+                            interp_edge_note(edge_from, ipc,
+                                             interp_edge_kind_for_op(edge_op), edge_op,
+                                             in.sp);
+                        edge_from = ipc & 0xFFFFFFu;
+                        edge_op = op;
+                        edge_expect = interp_fallthrough_pc(ipc, op, in.mf, in.xf);
+                    }
+                    s_interp_bus_master=0;
+                    s_interp_bus_cycles=0;
+                    s_interp_bus_timing_active=1;
+                    g_interp_wlog_pc24 = ipc & 0xFFFFFFu;
+                    cpu->coprocessor_master_cycles = cpu->master_cycles;
+                    if (g_interp_bridge_pc_hook)
+                        g_interp_bridge_pc_hook(ipc & 0xFFFFFFu,
+                                                in.mf ? 1 : 0, in.xf ? 1 : 0);
+                    /* interp816_runOpcode for CMP dp / LDA dp / Bcc rel. */
+                    in.cyclesUsed = 0;
+                    const uint8_t xop = bridge_bus_read(cpu, ((uint32_t)in.k << 16) | in.pc++);
+                    int _cyc = xop == 0xC5 || xop == 0xA5 ? 3 : 2;   /* cyclesPerOpcode */
+                    if (xop == 0xC5 || xop == 0xA5) {
+                        const uint8_t dadr = bridge_bus_read(cpu, ((uint32_t)in.k << 16) | in.pc++);
+                        if (in.dp & 0xff) _cyc++;
+                        const uint32_t low = (in.dp + dadr) & 0xffff;
+                        const uint32_t high = (in.dp + dadr + 1) & 0xffff;
+                        uint16_t value;
+                        if (in.mf) {
+                            value = bridge_bus_read(cpu, low);
+                        } else {
+                            _cyc++;
+                            if (!bridge_bus_read_word(cpu, low, high, &value)) {
+                                const uint8_t vl = bridge_bus_read(cpu, low);
+                                value = (uint16_t)(vl | (bridge_bus_read(cpu, high) << 8));
+                            }
+                        }
+                        if (xop == 0xC5) {
+                            int result;
+                            if (in.mf) {
+                                result = (in.a & 0xff) + (uint8_t)(value ^ 0xff) + 1;
+                                in.c = result > 0xff;
+                                in.z = (result & 0xff) == 0;
+                                in.n = result & 0x80;
+                            } else {
+                                result = in.a + (uint16_t)(value ^ 0xffff) + 1;
+                                in.c = result > 0xffff;
+                                in.z = (uint16_t)result == 0;
+                                in.n = result & 0x8000;
+                            }
+                        } else if (in.mf) {
+                            in.a = (in.a & 0xff00) | (uint8_t)value;
+                            in.z = (in.a & 0xff) == 0;
+                            in.n = in.a & 0x80;
+                        } else {
+                            in.a = value;
+                            in.z = in.a == 0;
+                            in.n = in.a & 0x8000;
+                        }
+                    } else {
+                        const uint8_t rel = bridge_bus_read(cpu, ((uint32_t)in.k << 16) | in.pc++);
+                        bool take;
+                        switch (xop) {
+                        case 0xF0: take = in.z; break;
+                        case 0xD0: take = !in.z; break;
+                        case 0x10: take = !in.n; break;
+                        case 0x30: take = in.n; break;
+                        case 0x50: take = !in.v; break;
+                        case 0x70: take = in.v; break;
+                        case 0x90: take = !in.c; break;
+                        default:   take = in.c; break;          /* 0xB0 */
+                        }
+                        if (take) { _cyc++; in.pc += (int8_t)rel; }
+                    }
+                    in.cyclesUsed = (uint8_t)_cyc;
+                    interp816_account_external(ipc, (unsigned)_cyc);
+                    s_interp_bus_timing_active=0;
+                    /* Post-opcode accounting, as in the loop above. */
+                    if (_cyc <= 0) _cyc = 1;
+                    {
+                        unsigned _internal = (unsigned)_cyc > s_interp_bus_cycles
+                                           ? (unsigned)_cyc - s_interp_bus_cycles : 0;
+                        uint64_t _master = s_interp_bus_master + (uint64_t)_internal * 6u;
+                        g_interp_bridge_steps++;
+                        cpu->cycles        += (uint64_t)_cyc;
+                        cpu->master_cycles += _master;
+                        snes_refresh_charge();
+                        cpu->coprocessor_master_cycles = cpu->master_cycles;
+                        snes_sync_master_clock(g_snes, cpu->master_cycles);
+                        cart_sync_coprocessors(g_snes->cart, cpu->master_cycles);
+                        if (rtl_apu_extended_frame_timing() ||
+                            !interp_bridge_use_absolute_apu_timeline(
+                                rtl_apu_frame_timeline_active(),
+                                cart_has_sa1(g_snes->cart), false)) {
+                            s_apu_pending_master += _master;
+                            if (s_apu_pending_master >= bridge_bounce_flush_thresh()) bridge_apu_flush(cpu);
+                        }
+                    }
+                    if (progress_write_epoch != g_interp_bridge_write_epoch ||
+                        progress_dynamic_epoch != s_interp_dynamic_progress_epoch) {
+                        progress_write_epoch=g_interp_bridge_write_epoch;
+                        progress_dynamic_epoch=s_interp_dynamic_progress_epoch;
+                        bridge_apu_flush(cpu);
+                        steps=0;
+                    }
+                    if (steps == 0 && out_landing)
+                        *out_landing = ((uint32_t)in.k << 16) | in.pc;
+                    steps++;                                    /* end of the step */
+                    if ((++s_wait_fp_insns & 0x3FFFFFu) == 0) {
+                        static int s_stats = -1;
+                        if (s_stats < 0) s_stats = getenv("SNESRECOMP_WAIT_FASTPATH_STATS") != NULL;
+                        if (s_stats)
+                            fprintf(stderr, "[wait-fastpath] %llu instructions so far, frame %d\n",
+                                    (unsigned long long)s_wait_fp_insns, snes_frame_counter);
+                    }
+                }
+                /* Hand the next instruction to the loop: its `continue` adds
+                 * the step back. */
+                steps--;
+                continue;
+            }
+        }
+#endif
         /* Opt-in control-flow tripwire: game code normally executes from the
          * LoROM $8000-$FFFF half of a bank.  If a return/jump crosses from ROM
          * into the low I/O/RAM half, capture the transition and a substantial

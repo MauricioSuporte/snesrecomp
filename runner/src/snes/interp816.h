@@ -86,6 +86,9 @@ uint8_t  interp816_getFlags(Interp816 *cpu);
 void     interp816_setFlags(Interp816 *cpu, uint8_t val);
 void     interp816_saveload(Interp816 *cpu, SaveLoadInfo *sli);
 
+/* Bookkeeping for an opcode the bridge executed itself (wait-loop shortcut). */
+void     interp816_account_external(uint32_t opcode_pc24, unsigned cycles);
+
 /* Whole-run interpreted-execution tallies (always-on, every configuration). */
 uint64_t interp816_insns_total(void);
 uint64_t interp816_cycles_total(void);
