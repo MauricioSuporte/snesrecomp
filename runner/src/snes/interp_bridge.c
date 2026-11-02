@@ -2162,7 +2162,11 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
          * Any check that wants the general path hands the instruction back
          * BEFORE its quiescent step, so the loop below repeats exactly the
          * checks this shortcut made. SNESRECOMP_WAIT_FASTPATH=0 disables it. */
-        if (wait_fp_ok && !in.e && !in.stopped && !in.waiting &&
+        /* Only right after the loop's own branch came back to P (the
+         * previous step was the Bcc at P+2): one compare per step, the shape
+         * test below runs only then. */
+        if (wait_fp_ok && edge_from == ((pc_before + 2) & 0xFFFFFFu) &&
+            !in.e && !in.stopped && !in.waiting &&
             !in.nmiWanted && !in.irqWanted && !g_tier2_capture_active &&
             g_snes && g_snes->cart &&
             (g_snes->cart->type == CART_HIROM || g_snes->cart->type == CART_LOROM) &&
