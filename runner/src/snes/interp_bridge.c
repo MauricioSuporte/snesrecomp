@@ -224,22 +224,72 @@ static int bridge_read_is_stable(uint32_t adr) {
     return cart_getRomPtr(g_snes->cart, bank, a) != NULL;
 }
 
+#ifndef SNESRECOMP_INTERP_PLAIN_FAST_READ
+#define SNESRECOMP_INTERP_PLAIN_FAST_READ 1
+#endif
+static void bridge_note_dynamic_value(uint32_t adr, uint8_t value);
 static uint8_t bridge_bus_read(void *mem, uint32_t adr) {
     CpuState *cpu = (CpuState *)mem;
     bridge_timing_bus(adr);
+#if SNESRECOMP_INTERP_PLAIN_FAST_READ
+    /* Plain LoROM/HiROM carts: WRAM and ROM reads resolved here in one pass,
+     * with the same effects as the general path below (cart bus latch, open
+     * bus, poll-detector epochs, dynamic-value table), instead of classifying
+     * the address in bridge_read_is_stable / bridge_continuous_read and
+     * decoding it again in cpu_read8 -> RomPtr -> cart_getRomPtr. The mapping
+     * is resolved from the live cart on every read; nothing is cached. Other
+     * cart types, MMIO, SRAM and unmapped addresses take the general path. */
+    {
+        Cart *cart = g_snes ? g_snes->cart : NULL;
+        if (cart && (cart->type == CART_HIROM || cart->type == CART_LOROM)) {
+            const uint8_t bank = (uint8_t)(adr >> 16);
+            const uint16_t a = (uint16_t)adr;
+            const int32_t off = cpu_wram_offset(bank, a);
+            if (off >= 0) {
+                const uint8_t value = cpu->ram[off];
+                cart->cpuBusAddress = ((uint32_t)bank << 16) | a;
+                cpu->open_bus = value;
+                /* WRAM is stable; the $0000-$1FFF mirror in the system banks
+                 * is a continuous read (bridge_continuous_read), $7E/$7F not. */
+                if (bank != 0x7E && bank != 0x7F) {
+                    s_interp_continuous_read_epoch++;
+                    bridge_note_dynamic_value(adr, value);
+                }
+                return value;
+            }
+            if (cart->rom && cart->romSize) {
+                uint32_t rom_off = UINT32_MAX;
+                if (cart->type == CART_HIROM) {
+                    const uint8_t canonical = bank & 0x7f;
+                    if (a >= 0x8000 || canonical >= 0x40)
+                        rom_off = ((uint32_t)(canonical & 0x3f) << 16) | a;
+                } else if (a >= 0x8000) {
+                    rom_off = ((uint32_t)(bank & 0x7f) << 15) | (a & 0x7fff);
+                }
+                if (rom_off != UINT32_MAX) {
+                    const uint8_t value = cart->rom[rom_off % cart->romSize];
+                    cart->cpuBusAddress = ((uint32_t)bank << 16) | a;
+                    cpu->open_bus = value;
+                    return value;   /* ROM: stable, not continuous */
+                }
+            }
+        }
+    }
+#endif
     if (!bridge_read_is_stable(adr)) s_interp_volatile_read_epoch++;
     int continuous=bridge_continuous_read(adr);
     if (continuous) s_interp_continuous_read_epoch++;
     if (bridge_is_apu_port(adr)) bridge_apu_flush(cpu);
     uint8_t value=cpu_read8(cpu,(uint8)((adr>>16)&0xff),(uint16)adr);
-    if (continuous) {
-        BridgeDynamicValue *d=&s_bridge_dynamic_values[(adr^(adr>>8)^(adr>>16))&63];
-        if (!d->valid || d->address!=adr || d->value!=value) {
-            d->valid=1; d->address=adr; d->value=value;
-            s_interp_dynamic_progress_epoch++;
-        }
-    }
+    if (continuous) bridge_note_dynamic_value(adr, value);
     return value;
+}
+static void bridge_note_dynamic_value(uint32_t adr, uint8_t value) {
+    BridgeDynamicValue *d=&s_bridge_dynamic_values[(adr^(adr>>8)^(adr>>16))&63];
+    if (!d->valid || d->address!=adr || d->value!=value) {
+        d->valid=1; d->address=adr; d->value=value;
+        s_interp_dynamic_progress_epoch++;
+    }
 }
 /* The bridge's own look at instruction bytes (poll-shape recognition), not a
  * guest access: it must not count as a volatile read, or a shape check that
