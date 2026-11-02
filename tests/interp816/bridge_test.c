@@ -403,6 +403,27 @@ static void redirect_b(CpuState *cpu,uint32_t pc) {
     interp_bridge_pre_opcode_redirect(0x008010);
 }
 static void forbidden_c(CpuState *cpu,uint32_t pc) {(void)cpu;(void)pc;++hook_c;}
+/* S15c: pre-opcode hook lookup. Every firing is logged as (step, pc, id); the
+ * log must be the same with the PC bitmap filter and with the linear scan
+ * (run.sh builds both and compares the S15c line). */
+static unsigned s15c_step, s15c_n;
+static char s15c_log[4096];
+static void s15c_count(uint32_t pc24, int m, int x) { (void)pc24; (void)m; (void)x; ++s15c_step; }
+static void s15c_note(uint32_t pc, int id) {
+    int used = (int)strlen(s15c_log);
+    if (used < (int)sizeof s15c_log - 32)
+        snprintf(s15c_log + used, sizeof s15c_log - (size_t)used, " %u:%06X:%d",
+                 s15c_step, (unsigned)pc, id);
+    ++s15c_n;
+}
+static void s15c_h1(CpuState *c, uint32_t pc) { (void)c; s15c_note(pc, 1); }
+static void s15c_h2(CpuState *c, uint32_t pc) { (void)c; s15c_note(pc, 2); }
+static void s15c_h3(CpuState *c, uint32_t pc) { (void)c; s15c_note(pc, 3); }
+static void s15c_h4(CpuState *c, uint32_t pc) { (void)c; s15c_note(pc, 4); }
+static void s15c_never(CpuState *c, uint32_t pc) { (void)c; s15c_note(pc, 9); }
+static void s15c_redirect(CpuState *c, uint32_t pc) {
+    (void)c; s15c_note(pc, 5); interp_bridge_pre_opcode_redirect(0x008103);
+}
 /* S17: a "device" that answers on the 10th time the loop head is reached. */
 static unsigned g_poll_visits;
 static uint32_t g_poll_answer_addr;
@@ -1193,6 +1214,55 @@ int main(void) {
       CHECK(rc==1 && g_c.S==0x01ff,"combined-mod routine returns balanced");
       CHECK(hook_dest==208,"every observer executes, including the late sites");
       interp_bridge_set_pre_opcode_hook(0,NULL);
+    }
+    /* S15c: hook lookup by PC filter == linear scan. Bank ends, PC wrap,
+     * $80/$00 mirrors, $FFFFFF masked onto $7FFFFF, the same hook twice,
+     * several hooks on one PC, a redirect cutting later hooks, a replaced
+     * hook (set), a loop re-entering a hooked PC and a PC never executed. */
+    { memset(RAM,0,MEMSZ);init_cpu();
+      interp_bridge_set_pre_opcode_hook(0,NULL);
+      s15c_step=0;s15c_n=0;s15c_log[0]=0;
+      uint8_t a[]={0x5c,0xfe,0xff,0x7f};          /* $00:8000 JML $7F:FFFE */
+      load(0x008000,a,sizeof a);
+      RAM[0x7ffffe]=0xea; RAM[0x7fffff]=0xea;      /* NOP, NOP -> wraps to $7F:0000 */
+      uint8_t b[]={0x5c,0xfe,0xff,0x00};          /* $7F:0000 JML $00:FFFE */
+      load(0x7f0000,b,sizeof b);
+      RAM[0x00fffe]=0xea; RAM[0x00ffff]=0xea;      /* NOP, NOP -> wraps to $00:0000 */
+      uint8_t c[]={0x5c,0x00,0x81,0x00};          /* $00:0000 JML $00:8100 */
+      load(0x000000,c,sizeof c);
+      /* $8100 NOP / $8101 NOP (redirect -> $8103) / $8102 NOP / $8103 NOP /
+       * $8104 LDX #3 (8-bit X) / $8106 DEX / $8107 BNE $8106 / $8109 RTS */
+      uint8_t d[]={0xea,0xea,0xea,0xea,0xa2,0x03,0xca,0xd0,0xfd,0x60};
+      load(0x008100,d,sizeof d);
+      CHECK(interp_bridge_add_pre_opcode_hook(0x008000,s15c_h1),"S15c h1 $008000");
+      CHECK(interp_bridge_add_pre_opcode_hook(0x808000,s15c_h1),"S15c h1 mirror idempotent");
+      CHECK(interp_bridge_add_pre_opcode_hook(0x008000,s15c_h2),"S15c h2 composed");
+      CHECK(interp_bridge_add_pre_opcode_hook(0x7ffffe,s15c_h3),"S15c bank end -1");
+      CHECK(interp_bridge_add_pre_opcode_hook(0xffffff,s15c_h4),"S15c $FFFFFF masked");
+      CHECK(interp_bridge_add_pre_opcode_hook(0x7fffff,s15c_h1),"S15c $7FFFFF");
+      CHECK(interp_bridge_add_pre_opcode_hook(0x00ffff,s15c_h2),"S15c $00FFFF");
+      CHECK(interp_bridge_add_pre_opcode_hook(0x000000,s15c_h3),"S15c wrap $000000");
+      CHECK(interp_bridge_add_pre_opcode_hook(0x008101,s15c_redirect),"S15c redirect");
+      CHECK(interp_bridge_add_pre_opcode_hook(0x008101,s15c_h1),"S15c after redirect");
+      CHECK(interp_bridge_add_pre_opcode_hook(0x008102,s15c_never),"S15c skipped PC");
+      CHECK(interp_bridge_add_pre_opcode_hook(0x40003f,s15c_never),"S15c never executed");
+      CHECK(interp_bridge_add_pre_opcode_hook(0x008106,s15c_h2),"S15c loop PC");
+      interp_bridge_set_pre_opcode_hook(0x008104,s15c_h3);
+      interp_bridge_set_pre_opcode_hook(0x008104,s15c_h4);  /* replaces h3 */
+      g_c.emulation=0; g_c.x_flag=1; cpu_mirrors_to_p(&g_c);
+      g_interp_bridge_pc_hook=s15c_count;
+      cpu_push_jsr_return_frame(&g_c);
+      int rc=interp_bridge_run(&g_c,0x008000);
+      g_interp_bridge_pc_hook=NULL;
+      printf("S15c log=%s\n",s15c_log);
+      CHECK(rc==1 && g_c.S==0x01ff,"S15c routine returns balanced rc=%d S=%04X",rc,g_c.S);
+      CHECK(!strstr(s15c_log,":9"),"S15c skipped/never-executed hooks did not fire");
+      CHECK(s15c_n==12,"S15c firings=%u",s15c_n);
+      /* After clearing, nothing fires. */
+      interp_bridge_set_pre_opcode_hook(0,NULL);
+      s15c_n=0;init_cpu();cpu_push_jsr_return_frame(&g_c);
+      rc=interp_bridge_run(&g_c,0x008000);
+      CHECK(s15c_n==0,"S15c cleared table fires nothing (%u)",s15c_n);
     }
     /* S16: the always-on observability rings. One run of
      *   $8400 LDX #$05 / loop: DEX / BNE loop / STA $0420 /

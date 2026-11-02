@@ -428,6 +428,34 @@ static struct {
     InterpPreOpcodeHook hook;
 } s_pre_opcode_hooks[kInterpPreOpcodeHookSlots];
 static int s_pre_opcode_hook_count;
+/* Membership filter for the per-instruction hook lookup: one bit per masked
+ * PC (pc24 & $7FFFFF, 2^23 bits = 1 MiB of zero-initialised storage; only the
+ * pages holding set bits are ever touched). The interpreter scans the slot
+ * array only when the executing PC's bit is set, so the order, the hooks run
+ * and the redirect handling are those of the plain linear scan.
+ * SNESRECOMP_PRE_OPCODE_BITMAP=0 restores the scan on every instruction. */
+#ifndef SNESRECOMP_PRE_OPCODE_BITMAP
+#define SNESRECOMP_PRE_OPCODE_BITMAP 1
+#endif
+#if SNESRECOMP_PRE_OPCODE_BITMAP
+static uint64_t s_pre_opcode_pc_bits[(1u << 23) / 64];
+static inline void pre_opcode_bit_set(uint32_t key) {
+    s_pre_opcode_pc_bits[key >> 6] |= 1ull << (key & 63);
+}
+static inline int pre_opcode_bit_test(uint32_t key) {
+    return (int)((s_pre_opcode_pc_bits[key >> 6] >> (key & 63)) & 1u);
+}
+static void pre_opcode_bits_clear(void) {
+    for (int i = 0; i < s_pre_opcode_hook_count; i++) {
+        const uint32_t key = s_pre_opcode_hooks[i].pc24;
+        s_pre_opcode_pc_bits[key >> 6] &= ~(1ull << (key & 63));
+    }
+}
+#else
+static inline void pre_opcode_bit_set(uint32_t key) { (void)key; }
+static inline int pre_opcode_bit_test(uint32_t key) { (void)key; return 1; }
+static void pre_opcode_bits_clear(void) {}
+#endif
 static int s_pre_opcode_redirect_valid;
 static uint32_t s_pre_opcode_redirect_pc24;
 
@@ -441,12 +469,14 @@ bool interp_bridge_add_pre_opcode_hook(uint32_t pc24, InterpPreOpcodeHook hook) 
     s_pre_opcode_hooks[s_pre_opcode_hook_count].pc24=key;
     s_pre_opcode_hooks[s_pre_opcode_hook_count].hook=hook;
     ++s_pre_opcode_hook_count;
+    pre_opcode_bit_set(key);
     return true;
 }
 
 void interp_bridge_set_pre_opcode_hook(uint32_t pc24,
                                        InterpPreOpcodeHook hook) {
     if (!hook) {
+        pre_opcode_bits_clear();
         s_pre_opcode_hook_count = 0;
         return;
     }
@@ -461,6 +491,7 @@ void interp_bridge_set_pre_opcode_hook(uint32_t pc24,
         s_pre_opcode_hooks[s_pre_opcode_hook_count].pc24 = key;
         s_pre_opcode_hooks[s_pre_opcode_hook_count].hook = hook;
         s_pre_opcode_hook_count++;
+        pre_opcode_bit_set(key);
     } else {
         static int warned;
         if (!warned) {
@@ -1974,7 +2005,8 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
             }
             qring[steps & 63]=now;
         }
-        if (s_pre_opcode_hook_count > 0) {
+        if (s_pre_opcode_hook_count > 0 &&
+            pre_opcode_bit_test(pc_before & 0x7FFFFFu)) {
             const uint32_t key = pc_before & 0x7FFFFFu;
             bool redirected = false;
             for (int hi = 0; hi < s_pre_opcode_hook_count; hi++) {
