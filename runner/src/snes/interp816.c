@@ -359,6 +359,19 @@ int interp816_runOpcode(Interp816* cpu) {
   return cpu->cyclesUsed;
 }
 
+/* Tallies for one opcode executed outside interp816_runOpcode by the bridge's
+ * wait-loop shortcut (interp_bridge.c): the bookkeeping runOpcode keeps for
+ * each opcode it runs, so the whole-run counts and the page map stay exact. */
+void interp816_account_external(uint32_t opcode_pc24, unsigned cycles) {
+  s_interp816_opcodes_run++;
+  g_interp816_cur_pc = opcode_pc24;
+  s_interp816_insns++;
+  s_interp816_cycles += (uint64_t)cycles;
+  const unsigned pg = (unsigned)((opcode_pc24 >> 8) & 0xFFFFu);
+  s_interp_page_cycles[pg] += (uint64_t)cycles;
+  s_interp_page_insns[pg]++;
+}
+
 static uint8_t interp816_readOpcode(Interp816* cpu) {
   return interp816_read(cpu, (cpu->k << 16) | cpu->pc++);
 }
