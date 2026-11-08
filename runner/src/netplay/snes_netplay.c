@@ -1301,6 +1301,13 @@ int snes_netplay_start(const SnesNetplayConfig *cfg)
 
     np_diag_open_log();
 
+#if defined(SNES_HAS_LOBBY_CLIENT) && defined(RNET_LOBBY_HAS_MATCH_LIVE)
+    /* Tell the room browser this room is mid-match (a late joiner waits for
+     * the next one). Cleared in snes_netplay_shutdown. */
+    if (g_np.is_host && !strcmp(g_np.match_mode, "hosted_lobby"))
+        (void)rnet_lobby_set_match_live(1);
+#endif
+
     fprintf(stderr,
             "snes_netplay: started transport=%s slot=%d input_player=%d session=%u "
             "delay=%u host_authority=%d force_input_relay=%d bind=%s peer=%s\n",
@@ -1315,6 +1322,9 @@ int snes_netplay_start(const SnesNetplayConfig *cfg)
 
 void snes_netplay_shutdown(void)
 {
+#if defined(SNES_HAS_LOBBY_CLIENT) && defined(RNET_LOBBY_HAS_MATCH_LIVE)
+    if (g_np.is_host) (void)rnet_lobby_set_match_live(0);
+#endif
     snes_netplay_rb_shutdown();
 #if defined(SNESRECOMP_NET_ROLLBACK)
     snes_netplay_rb_bind(NULL);
